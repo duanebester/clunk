@@ -1,0 +1,11 @@
+version: '3.9'
+services:
+  postgres:
+    image: postgres:13
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_USER: jimmy
+      POSTGRES_PASSWORD: banana
+      POSTGRES_DB: world
+      # POSTGRES_HOST_AUTH_METHOD: trust
