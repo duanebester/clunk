@@ -1,6 +1,12 @@
 # Clunk
 
-Connecting to Postgres w/ sockets.
+### /kləNGk/
+
+*noun*
+
+__A heavy, dull sound such as that made by thick pieces of metal striking together.__
+
+Talking to Postgres via sockets. At this point in time, I'm just experimenting with Clojure; learning core.async.
 
 ### Running The Tests
 
