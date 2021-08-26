@@ -17,6 +17,6 @@
         raw (.digest algorithm bs)]
     (format "%032x" (BigInteger. 1 raw))))
 
-(defn calculate-pw [user password ^bytes salt]
+(defn calculate-pw [^String user ^String password ^bytes salt]
   (let [hex (md5 (.getBytes (str password user)))]
     (str "md5" (md5 (concat-byte-arrays (.getBytes ^String hex) salt)))))

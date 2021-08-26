@@ -20,6 +20,7 @@
     (recur)))
 
 (async/>!! (:out client) (clunk/get-startup username database))
-(async/>!! (:out client) (clunk/get-query "select 1 as x, 2 as y;"))
+;; (async/>!! (:out client) (clunk/get-query "select 1 as x, 2 as y;"))
+(async/>!! (:out client) (clunk/get-query "select * from country limit 10;"))
 
 (clunk/close-client client)

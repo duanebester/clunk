@@ -2,5 +2,7 @@
 .cpcache
 .lsp
 
+scratch/
+
 .nrepl-port
 *.bin
