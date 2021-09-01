@@ -1,8 +1,11 @@
 .calva
 .cpcache
 .lsp
+.cljs_node_repl
 
 scratch/
 
 .nrepl-port
 *.bin
+
+.vscode/

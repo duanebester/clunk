@@ -21,14 +21,15 @@
 
     spec/ISpec
     (read [_ buff pos]
-      (loop [index pos acc []]
+      (loop [index pos
+             acc   []]
         (let [b (obuf/read-byte buff index)]
           (if (zero? b)
-            [(inc (count acc)) (specstr/bytes->string (byte-array acc) (count acc))]
+            [(inc (count acc)) (specstr/bytes->string #?(:clj (byte-array acc) :cljs (js/Uint8Array. acc)) (count acc))]
             (recur (inc index) (conj acc b))))))
 
     (write [_ buff pos value]
-      (let [input (specstr/string->bytes (str value "\0"))
+      (let [input  (specstr/string->bytes (str value "\0"))
             length (count input)]
         (obuf/write-bytes buff pos length input)
         length))))
@@ -36,7 +37,15 @@
 
 (def header-codec (buf/spec :tag buf/byte :len buf/int32))
 (def auth-req-codec (buf/spec :tag buf/int32))
-(def row-desc-codec (buf/spec :field-name cstring :table-oid buf/int32 :column-attr buf/int16 :oid buf/int32 :data-type-size buf/int16 :type-modifier buf/int32 :format-code buf/int16))
+(def row-desc-codec 
+  (buf/spec
+   :field-name cstring
+   :table-oid buf/int32
+   :column-attr buf/int16
+   :oid buf/int32
+   :data-type-size buf/int16
+   :type-modifier buf/int32
+   :format-code buf/int16))
 
 ;; Usage
 (comment

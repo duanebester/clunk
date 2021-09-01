@@ -14,13 +14,18 @@
    (init-session username password database 5432 "localhost"))
   ([username password database port host]
    (let [message-socket (ms/get-message-socket port host)
-         in-ch (async/chan)
-         out-ch (async/chan)
-         state (atom {:status :Unknown})
-         session (map->Session {:message-socket message-socket :state state :in in-ch :out out-ch})]
+         in-ch          (async/chan)
+         out-ch         (async/chan)
+         state          (atom {:status :Unknown})
+         session        (map->Session {:message-socket message-socket
+                                       :state          state
+                                       :in             in-ch
+                                       :out            out-ch})]
 
      ;; Connect / Auth
-     (async/>!! (:out message-socket) {:type :StartupMessage :user username :database database})
+     (async/>!! (:out message-socket) {:type     :StartupMessage
+                                       :user     username
+                                       :database database})
      (loop []
        (when-let [message (async/<!! (:in message-socket))]
          (log/info message)
@@ -35,9 +40,10 @@
            (swap! state assoc :state :ReadyForQuery)
            {:type :AuthenticationMD5}
             ;; Respond with password
-           (let [salt (byte-array (:salt message))
+           (let [salt     (byte-array (:salt message))
                  password (pw/calculate-pw username password salt)]
-             (async/>!! (:out message-socket) {:type :PasswordMessage :password password }))
+             (async/>!! (:out message-socket) {:type     :PasswordMessage
+                                               :password password }))
            :else ()))
        (if (or (= :ReadyForQuery (:state @state)) (= :Error (:state @state)))
          (log/info "Connected")
@@ -62,9 +68,11 @@
 
      session)))
 
-(defn query [qs] {:type :Query :query qs})
+(defn query [qs] {:type  :Query
+                  :query qs})
 
-(defn close-session [{:keys [in out message-socket] :as this}]
+(defn close-session [{:keys [in out message-socket]
+                      :as   this}]
   (log/info "Closing Session")
   (ms/close-message-socket message-socket)
   (async/close! in)
