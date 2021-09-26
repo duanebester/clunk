@@ -2,6 +2,7 @@
 .cpcache
 .lsp
 .cljs_node_repl
+.clj-kondo
 
 scratch/
 

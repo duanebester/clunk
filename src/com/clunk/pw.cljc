@@ -19,7 +19,7 @@
              (let [ll (+ (.-length b1) (.-length b2))
                    bb (js/Int8Array. ll)
                    _ (.set bb b1)
-                   _ (.set bb b2 (count b1))]
+                   _ (.set bb b2 (.-length b1))]
                bb))))
 
 (defn bytes->md5-hex

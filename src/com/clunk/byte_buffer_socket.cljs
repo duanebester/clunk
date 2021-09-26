@@ -13,11 +13,18 @@
         buff-sock  (map->ByteBufferSocket {:client  client
                                            :in      in-ch
                                            :out     out-ch})]
+    (defn handle-data
+      ([d] (handle-data d 0))
+      ([d offset]
+       (when (< offset (.-length d))
+         (let [_ (.readInt8 d offset)
+               len (.readInt32BE d (+ 1 offset))
+               bb (.slice (.-buffer d) offset (+ 1 offset len))
+               buf (js/DataView. bb)]
+           (async/go (async/>! in-ch buf))
+           (handle-data d (+ len 1 offset))))))
 
-    (.on client "data" (fn [d]
-                         (let [b (.-buffer d)
-                               buf (js/DataView. b)]
-                           (async/put! in-ch buf))))
+    (.on client "data" (fn [d] (handle-data d)))
 
     (async/go-loop []
       (when-let [bs (async/<! out-ch)] ;; Receive buffer

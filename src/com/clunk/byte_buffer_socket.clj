@@ -1,5 +1,5 @@
 (ns com.clunk.byte-buffer-socket
-  (:require 
+  (:require
    [clojure.core.async :as async]
    [clojure.tools.logging :as log])
   (:import
@@ -7,77 +7,92 @@
    (java.nio.channels SocketChannel)
    (java.net InetSocketAddress)))
 
-(defrecord ByteBufferSocket [^SocketChannel channel in-ch out-ch])
+(defrecord ByteBufferSocket [^SocketChannel client in-ch out-ch])
 
-(defn- init-buffer-socket [channel]
+(defn connected? [^SocketChannel client]
+  (or (.isConnected client) (.isOpen client)))
+
+(defn- parse-header [bb]
+  (let [_ (.flip bb)
+        tag (.get bb)
+        len (.getInt bb)]
+    (log/info (str "RECEIVED TAG: " tag ", LENGTH: " len))
+    [tag len]))
+
+(defn- read-message [tag len client]
+  (let [bb (ByteBuffer/allocate (+ 1 len)) ;; Allocate for full message
+        _  (.put bb tag) ;; Add back tag
+        _  (.putInt bb len) ;; Add back length
+        _  (.read client bb)] ;; Read rest of message
+    (.flip bb)))
+
+(defn- init-buffer-socket [client]
   (let [in-ch      (async/chan)
         out-ch     (async/chan)
         header-buf (ByteBuffer/allocate 5)
-        buff-sock  (map->ByteBufferSocket {:channel channel
+        buff-sock  (map->ByteBufferSocket {:client client
                                            :in      in-ch
                                            :out     out-ch})]
-
     (async/go-loop []
-      (when (and (.isConnected channel) (.isOpen channel))
-        (.clear header-buf)
-        (let [n (.read channel header-buf)] ;; Read header
+      (when (connected? client)
+        (let [n (.read client header-buf)] ;; Read header
           (when (<= 5 n)
-            (let [_   (.flip header-buf)
-                  tag (.get header-buf)
-                  len (.getInt header-buf)]
-              #_(println (str "RECV Message - Tag: " tag " Length: " len))
+            (let [[tag len] (parse-header header-buf)]
               (when (pos? len)
-                (let [bb (ByteBuffer/allocate (+ 1 len)) ;; Read rest of message
-                      _  (.put bb tag)
-                      _  (.putInt bb len)
-                      _  (.read channel bb)]
+                (let [bb (read-message tag len client)]
                   (.clear header-buf)
-                  (when (async/>! in-ch (.flip bb)) ;; Send to downstream listeners
+                  (when (async/>! in-ch bb) ;; Send to downstream listeners
                     (recur)))))))))
 
     (async/go-loop []
-      (when (and (.isConnected channel) (.isOpen channel))
+      (when (connected? client)
         (when-let [bs (async/<! out-ch)] ;; Receive buffer
-          (try (.write channel bs) ;; Send it to SocketChannel
+          (try (.write client bs) ;; Send it to SocketChannel
                (catch Exception e (log/error e)))
           (recur))))
 
     buff-sock))
 
 (defn get-buffer-socket
-  ([port]
-   (get-buffer-socket (int port) "localhost"))
-  ([^Integer port ^String address]
-   (let [channel (SocketChannel/open)
-         address (InetSocketAddress. address port)]
-     (.configureBlocking channel true)
-     (.connect channel address)
-     (init-buffer-socket channel))))
+  [^Integer port ^String address]
+  (let [client (SocketChannel/open)
+        address (InetSocketAddress. address port)]
+    (.configureBlocking client true)
+    (.connect client address)
+    (init-buffer-socket client)))
 
-(defn close-buffer-socket [{:keys [in out ^SocketChannel channel]
+(defn close-buffer-socket [{:keys [in out ^SocketChannel client]
                             :as   this}]
-  (when-not (.isOpen channel)
+  (when (connected? client)
     (async/close! in)
     (async/close! out)
-    (.shutdownInput channel)
-    (.shutdownOutput channel)
-    (.close channel)
-    (assoc this :channel nil :in nil :out nil)))
+    (.shutdownInput client)
+    (.shutdownOutput client)
+    (.close client)
+    (assoc this :client nil :in nil :out nil)))
 
-;; Example usage:
+;; Example usage
 (comment
+  ;; Utility fn
   (defn print-ints
     "Prints byte array as ints"
     [ba]
     (println (map #(int %) ba)))
 
-  ;; Connect socket to postgres
-  (def buffer-socket (get-buffer-socket 5432))
-  ;; startup message for user: "jimmy" and database: "world"
-  (def startup-bytes (byte-array (map byte [0 0 0 35 0 3 0 0 117 115 101 114 0 106 105 109 109 121 0 100 97 116 97 98 97 115 101 0 119 111 114 108 100 0 0])))
+  (def buffer-socket (get-buffer-socket 5432 "localhost"))
+
+  ;; Startup message for user: "jimmy", and database: "world"
+  (def startup-bytes
+    (->>
+     (map byte [0 0 0 35 0 3 0 0 117 115 101 114 0 106 105 109 109 121 0 100 97 116 97 98 97 115 101 0 119 111 114 108 100 0 0])
+     byte-array
+     ByteBuffer/wrap))
 
   ;; Send ByteBuffer message
-  (async/>!! (:out buffer-socket) (ByteBuffer/wrap startup-bytes))
+  (async/>!! (:out buffer-socket) startup-bytes)
+
   ;; Print received Message
   (print-ints (.array (async/<!! (:in buffer-socket))))
+
+  ;; Close
   (close-buffer-socket buffer-socket))

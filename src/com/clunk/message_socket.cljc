@@ -9,11 +9,6 @@
 
 (defrecord MessageSocket [buffer-socket in-ch out-ch])
 
-(defn print-ints
-  "Prints byte array as ints"
-  [ba]
-  (println (map #(int %) ba)))
-
 (defn handle-backend-key-data [bs]
   (let [[id key] (buf/read bs (buf/spec buf/int32 buf/int32) {:offset 5})]
     {:type :BackendKeyData
