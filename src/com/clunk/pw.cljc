@@ -1,10 +1,10 @@
 (ns com.clunk.pw
-  #?(:clj 
+  #?(:clj
      (:import java.security.MessageDigest java.nio.ByteBuffer java.math.BigInteger)
-     :cljs 
+     :cljs
      (:require goog.crypt [cljs.nodejs :as node])))
 
-#?(:cljs 
+#?(:cljs
    (def crypto (node/require "crypto")))
 
 (defn concat-byte-arrays [^bytes b1 ^bytes b2]
@@ -16,10 +16,10 @@
                   _ (.put bb ^bytes b2)]
               (.array bb)))
      :cljs (when (and (not-empty b1) (not-empty b2))
-             (let [ll (+ (.-length b1) (.-length b2))
+             (let [ll (+ (.-byteLength b1) (.-byteLength b2))
                    bb (js/Int8Array. ll)
-                   _ (.set bb b1)
-                   _ (.set bb b2 (.-length b1))]
+                   _ (.set bb (js/Int8Array. b1) 0)
+                   _ (.set bb (js/Int8Array. b2) (.-byteLength b1))]
                bb))))
 
 (defn bytes->md5-hex
@@ -37,5 +37,5 @@
   (let [upass (str password user)
         upassarr #?(:clj (.getBytes upass "UTF-8") :cljs (goog.crypt/stringToUtf8ByteArray upass))
         hex (bytes->md5-hex upassarr)
-        hexarr #?(:clj (.getBytes hex "UTF-8") :cljs (goog.crypt/stringToUtf8ByteArray hex))]
+        hexarr #?(:clj (.getBytes hex "UTF-8") :cljs (js/Int8Array. (goog.crypt/stringToUtf8ByteArray hex)))]
     (str "md5" (bytes->md5-hex (concat-byte-arrays hexarr salt)))))

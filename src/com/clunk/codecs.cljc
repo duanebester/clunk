@@ -1,56 +1,51 @@
 (ns com.clunk.codecs
-  (:require [octet.core :as buf]
-            [octet.buffer :as obuf]
-            [octet.spec :as spec]
-            [octet.spec.string :as specstr]))
+  (:require [helins.binf :as binf]
+            [helins.binf.string :as binf.string])
+  #?(:clj (:import
+           (java.nio ByteBuffer))))
 
-(def ^{:doc "Arbitrary length cstring (null-terminated string) type spec."}
-  cstring
-  (reify
-    #?@(:clj
-        [clojure.lang.IFn
-         (invoke [s] s)]
-        :cljs
-        [cljs.core/IFn
-         (-invoke [s] s)])
+(defn wr-cstring [view string]
+  (binf/wr-string view (str string "\0"))
+  view)
 
-    spec/ISpecDynamicSize
-    (size* [_ data]
-      (let [data (specstr/string->bytes data)]
-        (inc (count data))))
+(defn rr-cstring [view]
+  (let [pos (binf/position view)]
+    (loop []
+      (if (zero? (binf/rr-u8 view))
+        (let [bb (binf/ra-buffer view pos (- (binf/position view) pos 1))]
+          (.toString
+           (.decode binf.string/decoder-utf-8
+                    #?(:clj (ByteBuffer/wrap bb)
+                       :cljs (js/Uint8Array. bb)))))
+        (recur)))))
 
-    spec/ISpec
-    (read [_ buff pos]
-      (loop [index pos
-             acc   []]
-        (let [b (obuf/read-byte buff index)]
-          (if (zero? b)
-            [(inc (count acc)) (specstr/bytes->string #?(:clj (byte-array acc) :cljs (js/Uint8Array. acc)) (count acc))]
-            (recur (inc index) (conj acc b))))))
+(defn rr-header
+  [view]
+  (let [tag (binf/rr-i8 view)
+        len (binf/rr-i32 view)]
+    {:tag tag :len len}))
 
-    (write [_ buff pos value]
-      (let [input  (specstr/string->bytes (str value "\0"))
-            length (count input)]
-        (obuf/write-bytes buff pos length input)
-        length))))
+(defn rr-auth-req
+  [view]
+  {:tag (binf/rr-i32 view)})
 
+(defn rr-auth-salt
+  [view]
+  (let [ss (binf/rr-buffer view 4)]
+    #?(:clj ss :cljs (js/Int8Array. ss))))
 
-(def header-codec (buf/spec :tag buf/byte :len buf/int32))
-(def auth-req-codec (buf/spec :tag buf/int32))
-(def row-desc-codec 
-  (buf/spec
-   :field-name cstring
-   :table-oid buf/int32
-   :column-attr buf/int16
-   :oid buf/int32
-   :data-type-size buf/int16
-   :type-modifier buf/int32
-   :format-code buf/int16))
-
-;; Usage
-(comment
-  (def spec (buf/spec buf/int32 cstring cstring buf/byte))
-  (def data [(int 10) "hay" "hey" (byte 1)])
-  (def buffer (buf/allocate 20))
-  (buf/write! buffer data spec)
-  (buf/read buffer spec))
+(defn rr-row-desc [view]
+  (let [field-name (rr-cstring view)
+        table-oid (binf/rr-i32 view)
+        column-attr (binf/rr-i16 view)
+        oid (binf/rr-i32 view)
+        data-type-size (binf/rr-i16 view)
+        type-mod (binf/rr-i32 view)
+        format-code (binf/rr-i16 view)]
+    {:field-name field-name
+     :table-oid table-oid
+     :column-attr column-attr
+     :oid oid
+     :data-type-size data-type-size
+     :type-modifier type-mod
+     :format-code format-code}))

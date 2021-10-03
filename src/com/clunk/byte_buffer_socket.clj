@@ -10,13 +10,13 @@
 (defrecord ByteBufferSocket [^SocketChannel client in-ch out-ch])
 
 (defn connected? [^SocketChannel client]
-  (or (.isConnected client) (.isOpen client)))
+  (and (.isConnected client) (.isOpen client)))
 
 (defn- parse-header [bb]
   (let [_ (.flip bb)
         tag (.get bb)
         len (.getInt bb)]
-    (log/info (str "RECEIVED TAG: " tag ", LENGTH: " len))
+    #_(println (str "RECEIVED TAG: " tag ", LENGTH: " len))
     [tag len]))
 
 (defn- read-message [tag len client]
@@ -46,7 +46,8 @@
 
     (async/go-loop []
       (when (connected? client)
-        (when-let [bs (async/<! out-ch)] ;; Receive buffer
+        (let [bs (async/<! out-ch)
+              _ (.flip bs)] ;; Receive buffer
           (try (.write client bs) ;; Send it to SocketChannel
                (catch Exception e (log/error e)))
           (recur))))
@@ -57,7 +58,7 @@
   [^Integer port ^String address]
   (let [client (SocketChannel/open)
         address (InetSocketAddress. address port)]
-    (.configureBlocking client true)
+    #_(.configureBlocking client true)
     (.connect client address)
     (init-buffer-socket client)))
 

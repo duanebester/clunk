@@ -1,11 +1,26 @@
 (ns com.clunk.byte-buffer-socket
   (:require
+   [helins.binf :as binf]
    [cljs.core.async :as async]
    [cljs.nodejs :as node]))
 
 (def net (node/require "net"))
 
+(defn connected? [client]
+  (not (and (.-connecting client) (.-destroyed client))))
+
 (defrecord ByteBufferSocket [client in-ch out-ch])
+
+(defn- handle-data
+  ([ch d] (handle-data ch d 0))
+  ([ch d offset]
+   (when (< offset (.-length d))
+     (let [_ (.readInt8 d offset)
+           len (.readInt32BE d (+ 1 offset))
+           bb (.slice (.-buffer d) offset (+ 1 offset len))
+           buf (binf/view bb)]
+       (async/go (async/>! ch buf))
+       (handle-data ch d (+ len 1 offset))))))
 
 (defn- init-buffer-socket [client]
   (let [in-ch      (async/chan)
@@ -13,23 +28,14 @@
         buff-sock  (map->ByteBufferSocket {:client  client
                                            :in      in-ch
                                            :out     out-ch})]
-    (defn handle-data
-      ([d] (handle-data d 0))
-      ([d offset]
-       (when (< offset (.-length d))
-         (let [_ (.readInt8 d offset)
-               len (.readInt32BE d (+ 1 offset))
-               bb (.slice (.-buffer d) offset (+ 1 offset len))
-               buf (js/DataView. bb)]
-           (async/go (async/>! in-ch buf))
-           (handle-data d (+ len 1 offset))))))
 
-    (.on client "data" (fn [d] (handle-data d)))
+    (.on client "data" (fn [d] (handle-data in-ch d)))
 
     (async/go-loop []
-      (when-let [bs (async/<! out-ch)] ;; Receive buffer
-        (.write client (js/Uint8Array. (.-buffer bs))) ;; Send it to SocketChannel
-        (recur)))
+      (when (connected? (:client buff-sock))
+        (let [bs (async/<! out-ch)] ;; Receive buffer
+          (.write client (js/Uint8Array. (.-buffer bs))) ;; Send it to SocketChannel
+          (recur))))
 
     buff-sock))
 

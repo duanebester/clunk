@@ -1,12 +1,13 @@
-{:deps    {funcool/octet             {:mvn/version "1.1.2"}
+{:deps    {io.helins/binf            {:mvn/version "1.1.0-beta1"}
            org.clojure/clojurescript {:mvn/version "1.10.879"}
            org.clojure/core.match    {:mvn/version "1.0.0"}
            org.clojure/core.async    {:mvn/version "1.3.618"}
            org.clojure/tools.logging {:mvn/version "1.1.0"}}
 
- :paths ["src" "test"]
+ :paths ["src"]
 
- :aliases {:test {:extra-paths ["test"]
+ :aliases {:dev  {:extra-paths ["src/com/clunk"]}
+           :test {:extra-paths ["test"]
                   :extra-deps  {io.github.cognitect-labs/test-runner {:git/url "https://github.com/cognitect-labs/test-runner.git"
                                                                       :sha     "8c3f22363d63715de4087b038d79ae0de36a3263"}}
                   :main-opts   ["-m" "cognitect.test-runner"]
