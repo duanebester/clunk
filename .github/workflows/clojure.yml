@@ -1,0 +1,35 @@
+name: Clojure CI
+
+on:
+  push:
+    branches: [ experimental ]
+  pull_request:
+    branches: [ experimental ]
+
+jobs:
+  test:
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macOS-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Prepare java
+        uses: actions/setup-java@v2
+        with:
+          distribution: 'zulu'
+          java-version: '8'
+
+      - name: Install clojure tools
+        uses: DeLaGuardo/setup-clojure@3.5
+        with:
+          cli: 1.10.1.693 # Clojure CLI based on tools.deps
+
+      - name: Execute clojure code on Linux and MacOS
+        run: clojure -X:test
+        shell: bash
