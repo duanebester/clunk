@@ -1,5 +1,27 @@
 # Clunk
 
+<style>
+    img.logo-dark {
+        display: none;
+        width: 300px;
+    }
+    img.logo-light {
+        display: unset;
+        width: 300px;
+    }
+    @media (prefers-color-scheme: dark) {
+        img.logo-dark {
+            display: unset;
+        }
+        img.logo-light {
+            display: none;
+        }
+    }
+</style>
+
+<img class="logo-light" src="./assets/logos/clunk-black@2x.png" />
+<img class="logo-dark" src="./assets/logos/clunk-white@2x.png" />
+
 ### /kləNGk/
 
 *noun*
@@ -26,75 +48,58 @@ Now you can run the [tests](test/com/clunk/core_test.clj) with
 clj -X:test
 ```
 
-### [Example](example/example.clj)
+### Example
 
-Require the following:
 ```clj
-(require '[com.clunk.core :as clunk]
-         '[clojure.core.async :as async]
-         '[clojure.core.match :as m])
+(ns scratch.client
+  (:require
+   [com.clunk.core :as clunk]))
 
-(def username "jimmy")
-(def password "banana")
-(def database "world")
-(def port (int 5432))
+(def cfg {:username "jimmy"
+          :password "banana"
+          :database "world"})
 ```
 
-We can now create a client, and a receive handler that responds to an MD5 Authentication request, and also prints all received messages:
+We can now create a client, and connect to the postgres instance:
 ```clj
-(def client (clunk/socket-client port))
+(def client (clunk/client cfg))
 
-;; Receive Handler
-(async/go-loop []
-  (when-let [msg (async/<! (:in client))]
-    ;; Print any received message
-    (println (str "Received Message: " msg))
-    (m/match msg
-      {:type :AuthenticationMD5}
-      ;; Send MD5 password with received salt
-      (async/>! (:out client) (clunk/get-password username password (byte-array (:salt msg))))
-      :else nil)
-    (recur)))
-```
-
-Now we can send the Startup Message:
-```clj
-(async/>!! (:out client) (clunk/get-startup username database))
+(clunk/connect client)
 ```
 
 We will see a bunch of received messages:
 ```bash
-Received Message: {:type :AuthenticationMD5, :salt [-47 -110 29 -114]}
-Received Message: {:type :AuthenticationOk}
-Received Message: {:type :ParameterStatus, :status ["application_name" ""]}
-Received Message: {:type :ParameterStatus, :status ["client_encoding" "UTF8"]}
-Received Message: {:type :ParameterStatus, :status ["DateStyle" "ISO, MDY"]}
-Received Message: {:type :ParameterStatus, :status ["integer_datetimes" "on"]}
-Received Message: {:type :ParameterStatus, :status ["IntervalStyle" "postgres"]}
-Received Message: {:type :ParameterStatus, :status ["is_superuser" "on"]}
-Received Message: {:type :ParameterStatus, :status ["server_encoding" "UTF8"]}
-Received Message: {:type :ParameterStatus, :status ["server_version" "13.4 (Debian 13.4-1.pgdg100+1)"]}
-Received Message: {:type :ParameterStatus, :status ["session_authorization" "jimmy"]}
-Received Message: {:type :ParameterStatus, :status ["standard_conforming_strings" "on"]}
-Received Message: {:type :ParameterStatus, :status ["TimeZone" "Etc/UTC"]}
-Received Message: {:type :BackendKeyData, :id 167, :key 835881833}
-Received Message: {:type :ReadyForQuery, :status 73}
+{:type :AuthenticationMD5, :salt [-47 -110 29 -114]}
+{:type :AuthenticationOk}
+{:type :ParameterStatus, :param application_name, :status }
+{:type :ParameterStatus, :param client_encoding, :status UTF8}
+{:type :ParameterStatus, :param DateStyle, :status ISO, MDY}
+{:type :ParameterStatus, :param integer_datetimes, :status on}
+{:type :ParameterStatus, :param IntervalStyle, :status postgres}
+{:type :ParameterStatus, :param is_superuser, :status on}
+{:type :ParameterStatus, :param server_encoding, :status UTF8}
+{:type :ParameterStatus, :param server_version, :status 13.4 (Debian 13.4-1.pgdg100+1)}
+{:type :ParameterStatus, :param session_authorization, :status jimmy}
+{:type :ParameterStatus, :param standard_conforming_strings, :status on}
+{:type :ParameterStatus, :param TimeZone, :status Etc/UTC}
+{:type :BackendKeyData, :id 167, :key 835881833}
+{:type :ReadyForQuery, :status 73}
 ```
 
 Finally we can run a query:
 ```clj
-(async/>!! (:out client) (clunk/get-query "select 1 as x, 2 as y;"))
+(clunk/query client "SELECT name FROM country LIMIT 1;")
 ```
 
-Which produces the following:
+Which prints out the following:
 ```bash
-Received Message: {:type :RowDescription, ...}
-Received Message: {:type :DataRow, ...}
-Received Message: {:type :Close, ...}
-Received Message: {:type :ReadyForQuery, ...}
+{:type :RowDescription, ...}
+{:type :DataRow, ...}
+{:type :Close, ...}
+{:type :ReadyForQuery, ...}
 ```
 
 And lastly, close the client:
 ```clj
-(clunk/close-client client)
+(clunk/close client)
 ```

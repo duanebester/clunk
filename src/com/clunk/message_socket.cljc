@@ -109,9 +109,9 @@
                                      :user     username
                                      :database database}))
 
-  #_(async/go
-      (async/>! (:out message-socket) {:type     :Query
-                                       :query    "SELECT name from country;"}))
+  (async/go
+    (async/>! (:out message-socket) {:type     :Query
+                                     :query    "SELECT name FROM country LIMIT 3;"}))
 
 
   (close-message-socket message-socket))
