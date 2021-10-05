@@ -82,3 +82,12 @@ And lastly, close the client:
 ```clj
 (clunk/close client)
 ```
+
+Rough Todo / Help needed
+
+* Build out CLJS test suite
+* Figure out a good way to provide async query results
+* Fix core.async channel closing issues
+* Flush out frontend/backend message parsers
+* Deploy to Clojars
+* Deploy to npm
