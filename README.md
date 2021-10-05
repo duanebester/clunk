@@ -1,26 +1,6 @@
 # Clunk
 
-<style>
-    img.logo-dark {
-        display: none;
-        width: 300px;
-    }
-    img.logo-light {
-        display: unset;
-        width: 300px;
-    }
-    @media (prefers-color-scheme: dark) {
-        img.logo-dark {
-            display: unset;
-        }
-        img.logo-light {
-            display: none;
-        }
-    }
-</style>
-
-<img class="logo-light" src="./assets/logos/clunk-black@2x.png" />
-<img class="logo-dark" src="./assets/logos/clunk-white@2x.png" />
+![Logo](assets/logos/clunk-dual.svg)
 
 ### /kləNGk/
 
