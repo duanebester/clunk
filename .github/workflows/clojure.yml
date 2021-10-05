@@ -2,9 +2,9 @@ name: Clojure CI
 
 on:
   push:
-    branches: [ experimental, develop ]
+    branches: [ experimental, develop, main ]
   pull_request:
-    branches: [ experimental, develop ]
+    branches: [ experimental, develop, main ]
 
 jobs:
   test:

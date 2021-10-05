@@ -31,7 +31,7 @@ __A heavy, dull sound such as that made by thick pieces of metal striking togeth
 Talking to Postgres via sockets. At this point in time, I'm just experimenting with Clojure; learning core.async.
 
 
-[![Clojure CI](https://github.com/duanebester/clunk/actions/workflows/clojure.yml/badge.svg?branch=develop)](https://github.com/duanebester/clunk/actions/workflows/clojure.yml)
+[![Clojure CI](https://github.com/duanebester/clunk/actions/workflows/clojure.yml/badge.svg?branch=main)](https://github.com/duanebester/clunk/actions/workflows/clojure.yml)
 
 ### Running The Tests
 
