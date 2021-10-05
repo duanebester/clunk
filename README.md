@@ -30,9 +30,8 @@ __A heavy, dull sound such as that made by thick pieces of metal striking togeth
 
 Talking to Postgres via sockets. At this point in time, I'm just experimenting with Clojure; learning core.async.
 
-> Most development is happening on the [experimental](https://github.com/duanebester/clunk/tree/experimental) branch.
 
-[![Clojure CI](https://github.com/duanebester/clunk/actions/workflows/clojure.yml/badge.svg?branch=experimental)](https://github.com/duanebester/clunk/actions/workflows/clojure.yml)
+[![Clojure CI](https://github.com/duanebester/clunk/actions/workflows/clojure.yml/badge.svg?branch=develop)](https://github.com/duanebester/clunk/actions/workflows/clojure.yml)
 
 ### Running The Tests
 
