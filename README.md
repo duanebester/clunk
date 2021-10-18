@@ -1,5 +1,3 @@
-# Clunk
-
 ![Logo](assets/logos/clunk-dual.svg)
 
 ### /kləNGk/
@@ -32,6 +30,7 @@ clj -X:test
 ```clj
 (ns scratch.client
   (:require
+   [clojure.core.async :as async]
    [com.clunk.core :as clunk]))
 
 (def cfg {:username "jimmy"
