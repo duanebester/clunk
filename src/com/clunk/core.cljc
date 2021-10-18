@@ -26,7 +26,7 @@
   (async/go-loop []
     (when-let [message (async/<! (:in (:message-socket client)))]
       (when (:debug (:config client))
-        (println (str "Connect: " message)))
+        (println message))
       (when (m/match message
               {:type :ReadyForQuery}
               false
