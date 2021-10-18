@@ -22,6 +22,11 @@
     {:type   :ParameterStatus
      :param param :status status}))
 
+(defn print-ints
+  "Prints byte array as ints"
+  [ba]
+  (println (map (partial int) ba)))
+
 (defn handle-data-row [bs]
   (let [cols (binf/rr-i16 bs)]
     (loop [i      0
@@ -33,7 +38,8 @@
         (let [len  (binf/rr-i32 bs)
               data (binf/rr-buffer bs len)]
           (recur (inc i) (conj arr {:idx  i
-                                    :data data})))))))
+                                    :data data
+                                    :length len})))))))
 
 (defn handle-row-description [bs]
   (let [cols  (binf/rr-i16 bs)]
