@@ -1,7 +1,7 @@
-(ns com.clunk.buffered-message-socket
+(ns clunk.buffered-message-socket
   (:require [clojure.core.match :as m]
             [clojure.core.async :as async]
-            [com.clunk.message-socket :as ms]))
+            [clunk.message-socket :as ms]))
 
 (defrecord BufferedMessageSocket [buffered-socket in-ch out-ch])
 

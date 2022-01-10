@@ -1,8 +1,8 @@
-(ns com.clunk.messages
+(ns clunk.messages
   (:require [clojure.core.match :as m]
             [helins.binf :as binf]
             [helins.binf.buffer :as binf.buffer]
-            [com.clunk.codecs :as codecs]))
+            [clunk.codecs :as codecs]))
 
 (defn handle-backend-key-data [bs]
   (let [id (binf/rr-i32 bs)
@@ -61,7 +61,9 @@
       {:type :AuthenticationOk}
       {:tag 5}
       {:type :AuthenticationMD5
-       :salt (codecs/rr-auth-salt bs)})))
+       :salt (codecs/rr-auth-salt bs)}
+      {:tag 10}
+      {:type :AuthenticationClearText})))
 
 (defn handle-error
   ([bs] (handle-error bs []))
@@ -123,7 +125,7 @@
     "Prints byte array as ints"
     [ba]
     (println (map (partial int) ba)))
-  
+
   (defn rr-build-query
     [view]
     [(binf/rr-i8 view)

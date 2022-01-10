@@ -1,10 +1,10 @@
-(ns com.clunk.message-socket
+(ns clunk.message-socket
   (:require [clojure.core.match :as m]
             [clojure.core.async :as async]
-            [com.clunk.pw :as pw]
-            [com.clunk.messages :as messages]
-            [com.clunk.codecs :as codecs]
-            [com.clunk.byte-buffer-socket :as bs]))
+            [clunk.pw :as pw]
+            [clunk.messages :as messages]
+            [clunk.codecs :as codecs]
+            [clunk.byte-buffer-socket :as bs]))
 
 #?(:cljs (enable-console-print!))
 
@@ -112,6 +112,5 @@
   (async/go
     (async/>! (:out message-socket) {:type     :Query
                                      :query    "SELECT name FROM country LIMIT 3;"}))
-
 
   (close-message-socket message-socket))

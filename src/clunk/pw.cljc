@@ -1,4 +1,4 @@
-(ns com.clunk.pw
+(ns clunk.pw
   #?(:clj
      (:import java.security.MessageDigest java.nio.ByteBuffer java.math.BigInteger)
      :cljs

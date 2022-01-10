@@ -1,4 +1,4 @@
-(ns com.clunk.byte-buffer-socket
+(ns clunk.byte-buffer-socket
   (:require
    [helins.binf :as binf]
    [cljs.core.async :as async]

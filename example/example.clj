@@ -1,4 +1,4 @@
-(require '[com.clunk.core :as clunk]
+(require '[clunk.core :as clunk]
          '[clojure.core.async :as async]
          '[clojure.core.match :as m])
 

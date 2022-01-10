@@ -8,6 +8,6 @@ services:
       POSTGRES_USER: jimmy
       POSTGRES_PASSWORD: banana
       POSTGRES_DB: world
-    # POSTGRES_HOST_AUTH_METHOD: trust
+      # POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
       - ./.data/world.sql:/docker-entrypoint-initdb.d/world.sql

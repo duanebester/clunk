@@ -1,0 +1,9 @@
+{:deps
+ {:aliases [:cljs]}
+
+ :builds {:library {:target    :node-library
+                    :output-to "out/lib/clunk.js"
+                    :exports   {:client com.clunk.core/client
+                                :connect com.clunk.core/connect
+                                :close com.clunk.core/close
+                                :<q! com.clunk.core/<q!}}}}

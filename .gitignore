@@ -1,11 +1,13 @@
 .DS_Store
 
+.shadow-cljs
 .calva
 .cpcache
 .lsp
 .cljs_node_repl
 .clj-kondo
 
+target/
 scratch/
 
 .nrepl-port

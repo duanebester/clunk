@@ -1,4 +1,4 @@
-(ns com.clunk.byte-buffer-socket
+(ns clunk.byte-buffer-socket
   (:require
    [clojure.core.async :as async]
    [clojure.tools.logging :as log])
