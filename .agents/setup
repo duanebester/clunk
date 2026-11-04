@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Prepares an Amp orb (Debian 12) for clunk: JDK, Clojure CLI, Maven/git deps,
+# and a local Postgres 13 seeded with the "world" database the README and
+# example use (user jimmy / password banana / db world on localhost:5432).
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+CLOJURE_VERSION=1.12.6.1673
+PG_MAJOR=13
+PG_USER=jimmy
+PG_PASSWORD=banana
+PG_DB=world
+
+step() { printf '\n==> %s\n' "$*"; }
+timed() {
+  local start=$SECONDS
+  "$@"
+  printf '    (%ss)\n' "$((SECONDS - start))"
+}
+
+install_apt_packages() {
+  local packages=(openjdk-17-jdk-headless rlwrap "postgresql-$PG_MAJOR" "postgresql-client-$PG_MAJOR")
+  local missing=()
+  for pkg in "${packages[@]}"; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+  done
+  if [ "${#missing[@]}" -eq 0 ]; then
+    echo "    apt packages already installed"
+    return
+  fi
+
+  # Postgres 13 (what the README and docker-compose.yml use) comes from PGDG;
+  # Debian 12 only ships 15, whose SCRAM default clunk's MD5 auth can't speak.
+  if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
+    sudo install -d /usr/share/postgresql-common/pgdg
+    sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+      https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" |
+      sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+  fi
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}"
+}
+
+install_clojure() {
+  if command -v clojure >/dev/null 2>&1 &&
+    clojure --version 2>/dev/null | grep -q "$CLOJURE_VERSION"; then
+    echo "    Clojure CLI $CLOJURE_VERSION already installed"
+    return
+  fi
+  local installer
+  installer="$(mktemp)"
+  curl -fsSL -o "$installer" \
+    "https://github.com/clojure/brew-install/releases/download/$CLOJURE_VERSION/linux-install.sh"
+  sudo bash "$installer" >/dev/null
+  rm -f "$installer"
+}
+
+fetch_deps() {
+  # Downloads Maven deps and the git-based cognitect test-runner for every alias.
+  # Prefetch each alias on its own: combined, :dev's data.json would mask the
+  # version the test runner resolves alone.
+  clojure -P -M:dev
+  clojure -P -X:test
+}
+
+setup_postgres() {
+  local cluster_dir="/etc/postgresql/$PG_MAJOR/main"
+  [ -d "$cluster_dir" ] || sudo pg_createcluster "$PG_MAJOR" main
+
+  # Speed over durability; this is a throwaway dev database.
+  local conf="$cluster_dir/conf.d/amp-orb.conf"
+  local wanted=$'fsync = off\nsynchronous_commit = off\nfull_page_writes = off'
+  sudo systemctl enable --now "postgresql@$PG_MAJOR-main" >/dev/null 2>&1
+  if [ "$(sudo cat "$conf" 2>/dev/null)" != "$wanted" ]; then
+    printf '%s\n' "$wanted" | sudo tee "$conf" >/dev/null
+    sudo systemctl restart "postgresql@$PG_MAJOR-main"
+  fi
+  for _ in $(seq 1 30); do
+    pg_isready -q -h localhost -p 5432 && break
+    sleep 1
+  done
+  pg_isready -h localhost -p 5432
+
+  psql_admin() { sudo -u postgres psql -v ON_ERROR_STOP=1 -qtA "$@"; }
+
+  if [ "$(psql_admin -c "SELECT 1 FROM pg_roles WHERE rolname = '$PG_USER'")" != 1 ]; then
+    psql_admin -c "CREATE ROLE $PG_USER LOGIN SUPERUSER PASSWORD '$PG_PASSWORD'"
+  fi
+  if [ "$(psql_admin -c "SELECT 1 FROM pg_database WHERE datname = '$PG_DB'")" != 1 ]; then
+    psql_admin -c "CREATE DATABASE $PG_DB OWNER $PG_USER"
+  fi
+  if [ "$(psql_admin -d "$PG_DB" -c "SELECT to_regclass('public.country') IS NOT NULL")" != t ]; then
+    PGPASSWORD="$PG_PASSWORD" psql -v ON_ERROR_STOP=1 -q -h localhost -U "$PG_USER" -d "$PG_DB" \
+      -f .data/world.sql
+  fi
+  echo "    countries: $(PGPASSWORD="$PG_PASSWORD" psql -qtA -h localhost -U "$PG_USER" -d "$PG_DB" -c 'SELECT count(*) FROM country')"
+}
+
+step "Installing apt packages (JDK 17, Postgres $PG_MAJOR)"
+timed install_apt_packages
+
+step "Installing Clojure CLI $CLOJURE_VERSION"
+timed install_clojure
+
+step "Fetching Clojure dependencies"
+timed fetch_deps
+
+step "Starting and seeding Postgres $PG_MAJOR"
+timed setup_postgres
+
+step "Setup complete"

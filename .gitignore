@@ -12,3 +12,4 @@ scratch/
 *.bin
 
 .vscode/
+.amp/portals/
