@@ -61,7 +61,18 @@
       {:type :AuthenticationOk}
       {:tag 5}
       {:type :AuthenticationMD5
-       :salt (codecs/rr-auth-salt bs)})))
+       :salt (codecs/rr-auth-salt bs)}
+      {:tag 10}
+      {:type       :AuthenticationSASL
+       :mechanisms (loop [ms []]
+                     (let [m (codecs/rr-cstring bs)]
+                       (if (empty? m) ms (recur (conj ms m)))))}
+      {:tag 11}
+      {:type :AuthenticationSASLContinue
+       :data (binf/rr-string bs (binf/remaining bs))}
+      {:tag 12}
+      {:type :AuthenticationSASLFinal
+       :data (binf/rr-string bs (binf/remaining bs))})))
 
 (defn handle-error
   ([bs] (handle-error bs []))
@@ -102,6 +113,28 @@
         (binf/wr-b8 (byte 0x70))
         (binf/wr-b32 (int len))
         (codecs/wr-cstring password))
+    view))
+
+(defn build-sasl-initial-response
+  [^String mechanism ^String data]
+  (let [len  (+ 4 (count mechanism) 1 4 (count data))
+        view (binf/view (binf.buffer/alloc (+ 1 len)))]
+    (-> view
+        (binf/wr-b8 (byte 0x70))
+        (binf/wr-b32 (int len))
+        (codecs/wr-cstring mechanism)
+        (binf/wr-b32 (int (count data)))
+        (binf/wr-string data))
+    view))
+
+(defn build-sasl-response
+  [^String data]
+  (let [len  (+ 4 (count data))
+        view (binf/view (binf.buffer/alloc (+ 1 len)))]
+    (-> view
+        (binf/wr-b8 (byte 0x70))
+        (binf/wr-b32 (int len))
+        (binf/wr-string data))
     view))
 
 (defn build-startup

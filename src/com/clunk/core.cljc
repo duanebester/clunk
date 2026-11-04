@@ -23,23 +23,44 @@
 
 (defn connect
   [^Client client]
-  (async/go-loop []
-    (when-let [message (async/<! (:in (:message-socket client)))]
-      (when (:debug (:config client))
-        (println message))
-      (when (m/match message
-              {:type :ReadyForQuery}
-              false
-              {:type :AuthenticationOk}
-              true
-              {:type :AuthenticationMD5}
-          ;; Respond with password
-              (let [salt     (:salt message)
-                    password (pw/calculate-pw (:user (:config client)) (:password (:config client)) salt)]
-                (async/>! (:out (:message-socket client)) {:type     :PasswordMessage
-                                                           :password password}))
-              :else true)
-        (recur))))
+  (let [{:keys [user password debug]} (:config client)
+        out (:out (:message-socket client))]
+    ;; scram holds the in-flight SCRAM-SHA-256 exchange between auth messages.
+    (async/go-loop [scram nil]
+      (when-let [message (async/<! (:in (:message-socket client)))]
+        (when debug
+          (println message))
+        (case (:type message)
+          :ReadyForQuery
+          nil
+
+          :AuthenticationMD5
+          (do (async/>! out {:type     :PasswordMessage
+                             :password (pw/calculate-pw user password (:salt message))})
+              (recur scram))
+
+          :AuthenticationSASL
+          (if (some #{"SCRAM-SHA-256"} (:mechanisms message))
+            (let [first-msg (pw/scram-client-first)]
+              (async/>! out {:type      :SASLInitialResponse
+                             :mechanism "SCRAM-SHA-256"
+                             :data      (:message first-msg)})
+              (recur first-msg))
+            (println "Unsupported SASL mechanisms:" (:mechanisms message)))
+
+          :AuthenticationSASLContinue
+          (let [final-msg (pw/scram-client-final (assoc scram
+                                                        :password password
+                                                        :server-first (:data message)))]
+            (async/>! out {:type :SASLResponse :data (:message final-msg)})
+            (recur final-msg))
+
+          :AuthenticationSASLFinal
+          (if (pw/scram-server-final-valid? scram (:data message))
+            (recur nil)
+            (println "SCRAM server signature mismatch; refusing to continue"))
+
+          (recur scram)))))
   (async/>!! (:out (:message-socket client)) {:type     :StartupMessage
                                               :user     (:user (:config client))
                                               :database (:database (:config client))}))

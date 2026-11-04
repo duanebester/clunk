@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Makes sure the systemd-managed Postgres 13 is accepting connections after a wake.
+# Makes sure the systemd-managed Postgres is accepting connections after a wake.
 set -euo pipefail
 
 if ! pg_isready -q -h localhost -p 5432; then
-  sudo systemctl start postgresql@13-main
+  sudo systemctl start postgresql@18-main
   for _ in $(seq 1 8); do
     pg_isready -q -h localhost -p 5432 && exit 0
     sleep 1

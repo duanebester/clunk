@@ -43,7 +43,11 @@
     {:type :Query}
     (messages/build-query (:query message))
     {:type :PasswordMessage}
-    (messages/build-password (:password message))))
+    (messages/build-password (:password message))
+    {:type :SASLInitialResponse}
+    (messages/build-sasl-initial-response (:mechanism message) (:data message))
+    {:type :SASLResponse}
+    (messages/build-sasl-response (:data message))))
 
 (defn get-message-socket
   ([port] (get-message-socket port "localhost"))

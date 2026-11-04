@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Prepares an Amp orb (Debian 12) for clunk: JDK, Clojure CLI, Maven/git deps,
-# and a local Postgres 13 seeded with the "world" database the README and
+# and a local Postgres 18 seeded with the "world" database the README and
 # example use (user jimmy / password banana / db world on localhost:5432).
+# Postgres 18 authenticates with SCRAM-SHA-256 by default.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 CLOJURE_VERSION=1.12.6.1673
-PG_MAJOR=13
+PG_MAJOR=18
 PG_USER=jimmy
 PG_PASSWORD=banana
 PG_DB=world
@@ -30,8 +31,7 @@ install_apt_packages() {
     return
   fi
 
-  # Postgres 13 (what the README and docker-compose.yml use) comes from PGDG;
-  # Debian 12 only ships 15, whose SCRAM default clunk's MD5 auth can't speak.
+  # Debian 12 only ships Postgres 15; newer majors come from PGDG.
   if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
     sudo install -d /usr/share/postgresql-common/pgdg
     sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \

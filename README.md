@@ -13,7 +13,7 @@ Talking to Postgres via sockets. At this point in time, I'm just experimenting w
 
 ### Running The Tests
 
-You need to have a Postgres (13) Database up and running.
+You need to have a Postgres Database up and running. clunk authenticates with either MD5 or SCRAM-SHA-256 (the default since Postgres 14).
 
 ```bash
 docker compose up -d
