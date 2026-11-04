@@ -35,7 +35,8 @@
                                            :out     out-ch})]
     (async/go-loop []
       (when (connected? client)
-        (let [n (.read client header-buf)] ;; Read header
+        (let [n (try (.read client header-buf) ;; Read header
+                     (catch java.io.IOException _ -1))] ;; Socket closed under us
           (when (<= 5 n)
             (let [[tag len] (parse-header header-buf)]
               (when (pos? len)
@@ -46,8 +47,8 @@
 
     (async/go-loop []
       (when (connected? client)
-        (let [bs (async/<! out-ch)
-              _ (.flip bs)] ;; Receive buffer
+        (when-let [bs (async/<! out-ch)] ;; nil once out-ch is closed
+          (.flip bs)
           (try (.write client bs) ;; Send it to SocketChannel
                (catch Exception e (log/error e)))
           (recur))))
@@ -62,15 +63,14 @@
     (.connect client address)
     (init-buffer-socket client)))
 
-(defn close-buffer-socket [{:keys [in out ^SocketChannel client]
-                            :as   this}]
-  (when (connected? client)
-    (async/close! in)
-    (async/close! out)
-    (.shutdownInput client)
-    (.shutdownOutput client)
-    (.close client)
-    (assoc this :client nil :in nil :out nil)))
+(defn close-buffer-socket
+  "Idempotent: both the caller and the message socket's read loop close it."
+  [{:keys [in out ^SocketChannel client]
+    :as   this}]
+  (async/close! in)
+  (async/close! out)
+  (.close client)
+  (assoc this :client nil :in nil :out nil))
 
 ;; Example usage
 (comment
