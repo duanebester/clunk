@@ -76,20 +76,31 @@
                                nil
                                (clunk/plan c "SELECT generate_series(1, 1000)::int4 AS n"))))
        (t/is (= [{:n 7}] (deref (clunk/execute c "SELECT 7::int4 AS n") 5000 :timed-out)))
+       ;; nextval runs once per row the server produces, so the sequence counts
+       ;; them: stopping early must stop the server after the current batch.
+       @(clunk/execute c "CREATE TEMP SEQUENCE plan_rows")
+       (t/is (= [1 2] (into [] (comp (map :n) (take 2))
+                            (clunk/plan c ["SELECT nextval('plan_rows')::int4 AS n FROM generate_series(1, $1)" 100000]
+                                        {:fetch-size 100}))))
+       (t/is (= [{:n 100}] @(clunk/execute c "SELECT last_value::int4 AS n FROM plan_rows")))
        (clunk/close c))))
 
 (t/deftest a-cancelled-query-closes-early-and-the-next-one-runs
   (let [c (clunk/client config)]
     (run (async/go
            (async/<! (clunk/connect c))
+           ;; nextval runs once per row the server produces, so the sequence counts them.
+           (clunk/<query! c "CREATE TEMP SEQUENCE cancel_rows")
            (let [cancel (async/promise-chan)
-                 ch     (clunk/query c "SELECT generate_series(1, 1000)::int4 AS n" {:cancel cancel})]
+                 ch     (clunk/query c "SELECT nextval('cancel_rows')::int4 AS n FROM generate_series(1, 100000)" {:cancel cancel})]
              (t/is (= {:n 1} (async/<! ch)))
              ;; By now the client has filled ch and waits to put the next row.
              (async/<! (async/timeout 200))
              (async/close! cancel)
              (t/is (= [{:n 7}] (clunk/<query! c "SELECT 7::int4 AS n")))
              (t/is (> 999 (count (async/<! (async/into [] ch))))))
+           ;; The server stopped after the first batch, of the default 1000 rows.
+           (t/is (= [{:n 1000}] (clunk/<query! c "SELECT last_value::int4 AS n FROM cancel_rows")))
            (clunk/close c)))))
 
 (defn- bytes-of [b]
@@ -128,6 +139,36 @@
            ;; 400 KB arrives over many reads, so it decodes from a reassembled buffer.
            (let [[{b :b}] (clunk/<query! c "SELECT decode(repeat('00ff7f80', 100000), 'hex') AS b")]
              (t/is (= (take 400000 (cycle #?(:clj [0 -1 127 -128] :cljs [0 255 127 128]))) (bytes-of b))))
+           (clunk/close c)))))
+
+(t/deftest parameters-bind-and-a-failed-batch-lets-the-next-query-run
+  (let [c (clunk/client config)]
+    (run (async/go
+           (async/<! (clunk/connect c))
+           ;; The server infers $1's type from the column it is compared with.
+           (t/is (= [{:name "United States"}] (clunk/<query! c ["SELECT name FROM country WHERE code = $1" "USA"])))
+           ;; Zürich is 6 characters in 7 bytes.
+           (t/is (= [{:a 42 :b "Zürich" :n 6 :c true :d nil :e #?(:clj 12.50M :cljs "12.50")}]
+                    (clunk/<query! c ["SELECT $1::int4 AS a, $2::text AS b, length($2::text) AS n, $3::bool AS c, $4::int4 AS d, $5::numeric AS e"
+                                      42 "Zürich" true nil #?(:clj 12.50M :cljs "12.50")])))
+           (let [[row] (clunk/<query! c ["SELECT $1::bytea AS x, $2::date AS d, $3::timestamp AS ts, $4::timestamptz AS tz"
+                                         #?(:clj (byte-array [-34 -83 0]) :cljs (.-buffer (js/Uint8Array. #js [222 173 0])))
+                                         #?(:clj (LocalDate/of 2026 11 5) :cljs (js/Date. 2026 10 5))
+                                         #?(:clj (LocalDateTime/of 2026 11 5 13 45 1 123456000) :cljs (js/Date. 2026 10 5 13 45 1 123))
+                                         #?(:clj (OffsetDateTime/of 2026 11 5 7 45 1 500000000 (ZoneOffset/ofHours -6)) :cljs (js/Date. "2026-11-05T13:45:01.5Z"))])]
+             (t/is (= #?(:clj [-34 -83 0] :cljs [222 173 0]) (bytes-of (:x row))))
+             (t/is (= #?(:clj [(LocalDate/of 2026 11 5) (LocalDateTime/of 2026 11 5 13 45 1 123456000) (.toInstant (OffsetDateTime/of 2026 11 5 13 45 1 500000000 ZoneOffset/UTC))]
+                         :cljs [(js/Date. 2026 10 5) (js/Date. 2026 10 5 13 45 1 123) (js/Date. "2026-11-05T13:45:01.5Z")])
+                      [(:d row) (:ts row) #?(:clj (.toInstant ^OffsetDateTime (:tz row)) :cljs (:tz row))])))
+           (let [[err & more] (clunk/<query! c ["SELECT $1::int4, $2::int4" 1])]
+             (t/is (= "08P01" (:code (ex-data err))))
+             (t/is (empty? more)))
+           ;; Fails in the fifth batch, after the server has suspended the portal four times.
+           (let [rows (async/<! (async/into [] (clunk/query c "SELECT (1 / (450 - g))::int4 AS x FROM generate_series(1, 1000) g"
+                                                            {:cancel (async/promise-chan) :fetch-size 100})))]
+             (t/is (= 449 (count (butlast rows))))
+             (t/is (= "22012" (:code (ex-data (last rows))))))
+           (t/is (= [{:n 7}] (clunk/<query! c ["SELECT $1::int4 AS n" 7])))
            (clunk/close c)))))
 
 (t/deftest a-wrong-password-fails-connect

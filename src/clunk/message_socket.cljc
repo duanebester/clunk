@@ -24,16 +24,34 @@
       75 (messages/handle-backend-key-data bs)
       69 (messages/handle-error bs)
       68 (messages/handle-data-row bs)
-      67 (messages/handle-close bs)
+      67 (messages/handle-command-complete bs)
+      ;; Messages with no body worth reading.
+      49  {:type :ParseComplete}
+      50  {:type :BindComplete}
+      51  {:type :CloseComplete}
+      73  {:type :EmptyQueryResponse}
+      110 {:type :NoData}
+      115 {:type :PortalSuspended}
       (messages/handle-unknown bs header))))
 
-(defn handle-frontend [message]
-  (case (:type message)
-    :StartupMessage      (messages/build-startup (:user message) (:database message))
-    :Query               (messages/build-query (:query message))
-    :PasswordMessage     (messages/build-password (:password message))
-    :SASLInitialResponse (messages/build-sasl-initial-response (:mechanism message) (:data message))
-    :SASLResponse        (messages/build-sasl-response (:data message))))
+(defn handle-frontend
+  "Builds the bytes for a message, or for a vector of messages sent together."
+  [message]
+  (if (vector? message)
+    (messages/build-batch (map handle-frontend message))
+    (case (:type message)
+      :StartupMessage      (messages/build-startup (:user message) (:database message))
+      :Query               (messages/build-query (:query message))
+      :PasswordMessage     (messages/build-password (:password message))
+      :SASLInitialResponse (messages/build-sasl-initial-response (:mechanism message) (:data message))
+      :SASLResponse        (messages/build-sasl-response (:data message))
+      :Parse               (messages/build-parse (:query message))
+      :Bind                (messages/build-bind (:params message))
+      :Describe            (messages/build-describe-portal)
+      :Execute             (messages/build-execute (:max-rows message))
+      :Close               (messages/build-close-portal)
+      :Flush               (messages/build-flush)
+      :Sync                (messages/build-sync))))
 
 (defn- decode
   "handle-backend, except that a message that fails to decode becomes an error

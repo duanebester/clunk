@@ -25,34 +25,43 @@
                         (do (clunk/close c) (reject (js-error result)))
                         (resolve c))))))))
 
+(defn- sql-params
+  "sql with the values in a params array, null or undefined for none."
+  [sql params]
+  (if params (into [sql] params) sql))
+
 (defn query
-  "query(client, sql) resolves to an array of row objects."
-  [client sql]
-  (.then (clunk/execute client sql)
-         clj->js
-         #(throw (js-error %))))
+  "query(client, sql, params?) resolves to an array of row objects. params
+   is an array of the values of $1, $2, ... in sql."
+  ([client sql] (query client sql nil))
+  ([client sql params]
+   (.then (clunk/execute client (sql-params sql params))
+          clj->js
+          #(throw (js-error %)))))
 
 (defn stream
-  "stream(client, sql) is an async iterable of row objects, for for-await and
-   Readable.from. Leaving early (break, or a destroyed stream) lets the next
-   query run. A failed query rejects."
-  [client sql]
-  (let [cancel (async/promise-chan)
-        ch     (clunk/query client sql {:cancel cancel})
-        stop   #(async/close! cancel)
-        it     #js {:next   (fn []
-                              (js/Promise.
-                               (fn [resolve reject]
-                                 (async/take! ch (fn [row]
-                                                   (cond
-                                                     (nil? row)         (resolve #js {:done true})
-                                                     (clunk/error? row) (do (stop) (reject (js-error row)))
-                                                     :else              (resolve #js {:done false :value (clj->js row)})))))))
-                    :return (fn []
-                              (stop)
-                              (js/Promise.resolve #js {:done true}))}]
-    (aset it js/Symbol.asyncIterator (fn [] it))
-    it))
+  "stream(client, sql, params?) is an async iterable of row objects, for
+   for-await and Readable.from. The server sends rows in batches, so leaving
+   early (break, or a destroyed stream) stops it and lets the next query run.
+   A failed query rejects."
+  ([client sql] (stream client sql nil))
+  ([client sql params]
+   (let [cancel (async/promise-chan)
+         ch     (clunk/query client (sql-params sql params) {:cancel cancel})
+         stop   #(async/close! cancel)
+         it     #js {:next   (fn []
+                               (js/Promise.
+                                (fn [resolve reject]
+                                  (async/take! ch (fn [row]
+                                                    (cond
+                                                      (nil? row)         (resolve #js {:done true})
+                                                      (clunk/error? row) (do (stop) (reject (js-error row)))
+                                                      :else              (resolve #js {:done false :value (clj->js row)})))))))
+                     :return (fn []
+                               (stop)
+                               (js/Promise.resolve #js {:done true}))}]
+     (aset it js/Symbol.asyncIterator (fn [] it))
+     it)))
 
 (defn close [client]
   (clunk/close client)

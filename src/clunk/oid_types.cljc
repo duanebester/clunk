@@ -178,3 +178,38 @@
     1700                     (fn [view n] #?(:clj (bigdec (binf/rr-string view n))
                                              :cljs (binf/rr-string view n)))
     binf/rr-buffer))
+
+#?(:cljs
+   (defn- local-timestamp
+     "A Date as local time with its offset, as node-postgres sends it, so a
+      timestamp column stores the local time it reads back."
+     [^js d]
+     (let [pad    #(.padStart (str %1) %2 "0")
+           offset (- (.getTimezoneOffset d))]
+       (str (pad (.getFullYear d) 4) "-" (pad (inc (.getMonth d)) 2) "-" (pad (.getDate d) 2)
+            "T" (pad (.getHours d) 2) ":" (pad (.getMinutes d) 2) ":" (pad (.getSeconds d) 2)
+            "." (pad (.getMilliseconds d) 3)
+            (if (neg? offset) "-" "+") (pad (quot (js/Math.abs offset) 60) 2) ":" (pad (mod (js/Math.abs offset) 60) 2)))))
+
+(defn param-text
+  "The text Postgres reads for a query parameter, or nil for NULL. Strings,
+   numbers, booleans and UUIDs go as written, bytes as bytea hex, and dates
+   and times in ISO format. Postgres infers each parameter's type from the
+   query, so a parameter whose type the query doesn't fix, as in SELECT $1,
+   needs a cast such as $1::int4."
+  [v]
+  (cond
+    (nil? v)    nil
+    (string? v) v
+    #?@(:clj  [(bytes? v)
+               (let [sb (StringBuilder. "\\x")]
+                 (doseq [b ^bytes v]
+                   (.append sb (Character/forDigit (bit-and (bit-shift-right b 4) 15) 16))
+                   (.append sb (Character/forDigit (bit-and b 15) 16)))
+                 (str sb))
+               (decimal? v)                   (.toPlainString ^BigDecimal v)
+               (instance? java.util.Date v)   (str (.toInstant ^java.util.Date v))]
+        :cljs [(instance? js/Date v)          (local-timestamp v)
+               (or (instance? js/ArrayBuffer v) (instance? js/Uint8Array v))
+               (str "\\x" (.toString (js/Buffer.from v) "hex"))])
+    :else       (str v)))

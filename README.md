@@ -37,7 +37,14 @@ Talking to Postgres via sockets. At this point in time, I'm just experimenting w
 ;;  {:name "Algeria", :region "Northern Africa", :population 31471000}]
 ```
 
-To handle rows as they arrive, without holding them all in memory, reduce `plan`. It works with `reduce`, `transduce`, `into`, and `run!`, and `take` or another `reduced` value stops it early. It blocks the reducing thread, so don't reduce it inside a go block. A failed query throws.
+To pass values, give a vector of the SQL and its parameters, `$1`, `$2`, …, as next.jdbc does. clunk sends them apart from the SQL (with the extended query protocol), so they need no quoting or escaping. Postgres infers each parameter's type from the query; where nothing fixes it, as in `SELECT $1`, cast it (`$1::int4`). `nil` is `NULL`, and strings, numbers, booleans, UUIDs, byte arrays, `java.util.Date`, and `java.time` values all work. A query with parameters is a single statement; a plain string can hold several.
+
+```clj
+@(clunk/execute client ["SELECT name FROM country WHERE continent = $1 AND population > $2 ORDER BY name LIMIT 2" "Europe" 50000000])
+;; [{:name "France"} {:name "Germany"}]
+```
+
+To handle rows as they arrive, without holding them all in memory, reduce `plan`. It works with `reduce`, `transduce`, `into`, and `run!`, and `take` or another `reduced` value stops it early. The server sends the rows in batches of 1000 (pass `{:fetch-size n}` as a third argument to change it) and sends the next batch only when clunk asks for it, so stopping early stops the server too. Like a query with parameters, a `plan` is a single statement. It blocks the reducing thread, so don't reduce it inside a go block. A failed query throws.
 
 ```clj
 (transduce (map :population) + 0 (clunk/plan client "SELECT population FROM country;"))
@@ -45,6 +52,8 @@ To handle rows as they arrive, without holding them all in memory, reduce `plan`
 
 (into [] (comp (map :name) (take 2)) (clunk/plan client "SELECT name FROM city ORDER BY name;"))
 ;; ["A Coruña (La Coruña)" "Aachen"]
+
+(into [] (map :name) (clunk/plan client ["SELECT name FROM city WHERE countrycode = $1" "NLD"] {:fetch-size 100}))
 ```
 
 #### In a Ring handler
@@ -91,7 +100,7 @@ In an asynchronous Ring handler, complete the response from the future. Clojure 
 
 #### core.async
 
-`clunk/query` returns a channel of row maps that closes after the last row. A failed query puts an `ex-info` on the channel (check with `clunk/error?`) instead of throwing.
+`clunk/query` returns a channel of row maps that closes after the last row. It takes a string or a vector with parameters, as `execute` does. A failed query puts an `ex-info` on the channel (check with `clunk/error?`) instead of throwing.
 
 ```clj
 (async/go-loop [ch (clunk/query client "SELECT name FROM country ORDER BY name LIMIT 3;")]
@@ -100,7 +109,7 @@ In an asynchronous Ring handler, complete the response from the future. Clojure 
     (recur ch)))
 ```
 
-To stop early, pass a `:cancel` channel and close it. The row channel closes, and the client skips the rest of the result before running the next query. A `timeout` channel works as a time limit. Closing the row channel yourself isn't enough, because the client may already be waiting to put the next row on it.
+To stop early, pass a `:cancel` channel and close it. The row channel closes before the next query runs. With a `:cancel` channel, the server sends rows in batches of `:fetch-size` (1000 by default), so it stops after the current batch, whose remaining rows the client skips. A `timeout` channel works as a time limit. Closing the row channel yourself isn't enough, because the client may already be waiting to put the next row on it.
 
 ```clj
 (let [cancel (async/promise-chan)
@@ -109,6 +118,8 @@ To stop early, pass a `:cancel` channel and close it. The row channel closes, an
   (async/close! cancel))
 
 (clunk/query client "SELECT * FROM city" {:cancel (async/timeout 1000)})
+
+(clunk/query client ["SELECT * FROM city WHERE population > $1" 1000000] {:cancel cancel :fetch-size 100})
 ```
 
 Inside a go block, `<query!` parks until the query finishes and returns all its rows as a vector:
@@ -139,8 +150,13 @@ const client = await clunk.connect({ username: 'jimmy', password: 'banana', data
 const rows = await clunk.query(client, 'SELECT name FROM country ORDER BY name LIMIT 2');
 // [ { name: 'Afghanistan' }, { name: 'Albania' } ]
 
-// stream yields rows as they arrive. break stops reading, and the next query runs.
-for await (const row of clunk.stream(client, 'SELECT name, population FROM city ORDER BY population DESC')) {
+// An array of parameters fills in $1, $2, …, as in node-postgres.
+const big = await clunk.query(client, 'SELECT name FROM country WHERE continent = $1 ORDER BY population DESC LIMIT $2', ['Europe', 2]);
+// [ { name: 'Russian Federation' }, { name: 'Germany' } ]
+
+// stream yields rows as they arrive, which the server sends in batches of 1000.
+// break stops reading and the server, and the next query runs.
+for await (const row of clunk.stream(client, 'SELECT name, population FROM city WHERE population > $1 ORDER BY population DESC', [1000000])) {
   console.log(row);
   if (row.population < 9000000) break;
 }
@@ -154,6 +170,8 @@ clunk.close(client);
 const names = await Array.fromAsync(clunk.stream(client, 'SELECT name FROM country ORDER BY name LIMIT 3'));
 // [ { name: 'Afghanistan' }, { name: 'Albania' }, { name: 'Algeria' } ]
 ```
+
+Parameters can be strings, numbers, booleans, `null`, `Date`s (sent in local time with their offset, as node-postgres does), and `ArrayBuffer`s or `Buffer`s for `bytea`. Cast a parameter whose type the query doesn't fix, as in `SELECT $1::int4`. A query with parameters, and every `stream`, is a single statement.
 
 A failed query rejects with an `Error` that has the Postgres `code` and `severity`, and the `sql`, as properties, as node-postgres errors do.
 

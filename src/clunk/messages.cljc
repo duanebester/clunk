@@ -1,6 +1,7 @@
 (ns clunk.messages
   (:require [clunk.vendor.binf :as binf]
             [clunk.vendor.binf.buffer :as binf.buffer]
+            [clunk.vendor.binf.string :as binf.string]
             [clunk.codecs :as codecs]))
 
 (defn handle-backend-key-data [bs]
@@ -76,10 +77,9 @@
         :code     (get fields \C)
         :message  (get fields \M)}))))
 
-(defn handle-close [bs]
-  (let [close (binf/rr-i8 bs)
-        name (codecs/rr-cstring bs)]
-    {:type :Close :close close :name name}))
+(defn handle-command-complete [bs]
+  {:type :CommandComplete
+   :tag  (codecs/rr-cstring bs)})
 
 (defn handle-unknown [bs header]
   (let [unk (binf/rr-buffer bs (- (:len header) 4))]
@@ -141,6 +141,75 @@
         (codecs/wr-cstring "database")
         (codecs/wr-cstring database)
         (binf/wr-b8 (byte 0x00)))
+    view))
+
+;; The extended query protocol. clunk uses only the unnamed statement and the
+;; unnamed portal, both written as the empty string, and text format for
+;; parameters and results.
+
+(defn- frontend-message
+  "A message of tag, its int32 length, and body-size bytes that write puts on
+   the view."
+  [tag body-size write]
+  (let [view (binf/view (binf.buffer/alloc (+ 5 body-size)))]
+    (binf/wr-b8 view tag)
+    (binf/wr-b32 view (+ 4 body-size))
+    (write view)
+    view))
+
+(defn build-parse
+  "Parses sql into the unnamed statement, leaving the server to infer every
+   parameter's type."
+  [^String sql]
+  (let [q (binf.string/encode sql)]
+    (frontend-message 0x50 (+ 1 (count q) 1 2)
+                      #(-> %
+                           (binf/wr-b8 0)
+                           (binf/wr-buffer q)
+                           (binf/wr-b8 0)
+                           (binf/wr-b16 0)))))
+
+(defn build-bind
+  "Binds params, each a string or nil for NULL, to the unnamed portal."
+  [params]
+  (let [values (mapv #(some-> % binf.string/encode) params)]
+    (frontend-message 0x42 (reduce + (+ 1 1 2 2 2) (map #(+ 4 (count %)) values))
+                      (fn [view]
+                        (-> view
+                            (binf/wr-b8 0)
+                            (binf/wr-b8 0)
+                            (binf/wr-b16 0) ;; every parameter in text format
+                            (binf/wr-b16 (count values)))
+                        (doseq [v values]
+                          (if v
+                            (-> view (binf/wr-b32 (count v)) (binf/wr-buffer v))
+                            (binf/wr-b32 view -1)))
+                        (binf/wr-b16 view 0))))) ;; every result column in text format
+
+(defn build-describe-portal []
+  (frontend-message 0x44 2 #(-> % (binf/wr-b8 0x50) (binf/wr-b8 0))))
+
+(defn build-execute
+  "Runs the unnamed portal for up to max-rows rows, or all of them for 0."
+  [max-rows]
+  (frontend-message 0x45 5 #(-> % (binf/wr-b8 0) (binf/wr-b32 max-rows))))
+
+(defn build-close-portal []
+  (frontend-message 0x43 2 #(-> % (binf/wr-b8 0x50) (binf/wr-b8 0))))
+
+(defn build-flush []
+  (frontend-message 0x48 0 identity))
+
+(defn build-sync []
+  (frontend-message 0x53 0 identity))
+
+(defn build-batch
+  "Built messages copied into one buffer, so they go out in one write."
+  [views]
+  (let [buffers (map binf/backing-buffer views)
+        view    (binf/view (binf.buffer/alloc (reduce + (map count buffers))))]
+    (doseq [b buffers]
+      (binf/wr-buffer view b))
     view))
 
 (comment
