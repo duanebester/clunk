@@ -1,9 +1,9 @@
-(ns com.clunk.core
+(ns clunk.core
   (:require [clojure.core.match :as m]
             [clojure.core.async :as async]
-            [com.clunk.pw :as pw]
-            [com.clunk.oid-types :refer [oid-converter]]
-            [com.clunk.message-socket :as ms]))
+            [clunk.pw :as pw]
+            [clunk.oid-types :refer [oid-converter]]
+            [clunk.message-socket :as ms]))
 
 (defrecord Client [message-socket config in-ch out-ch])
 

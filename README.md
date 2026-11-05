@@ -19,7 +19,7 @@ You need to have a Postgres Database up and running. clunk authenticates with ei
 docker compose up -d
 ```
 
-Now you can run the [tests](test/com/clunk/core_test.clj) with
+Now you can run the [tests](test/clunk/core_test.clj) with
 
 ```bash
 clj -X:test
@@ -31,7 +31,7 @@ clj -X:test
 (ns scratch.client
   (:require
    [clojure.core.async :as async]
-   [com.clunk.core :as clunk]))
+   [clunk.core :as clunk]))
 
 (def cfg {:username "jimmy"
           :password "banana"

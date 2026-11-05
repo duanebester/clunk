@@ -1,9 +1,9 @@
-(ns com.clunk.pw-test
+(ns clunk.pw-test
   #?(:clj
-     (:require [com.clunk.pw :as pw]
+     (:require [clunk.pw :as pw]
                [clojure.test :as test])
      :cljs
-     (:require [com.clunk.pw :as pw]
+     (:require [clunk.pw :as pw]
                [cljs.test :as test])))
 
 #?(:cljs (enable-console-print!))

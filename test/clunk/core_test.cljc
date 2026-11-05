@@ -1,9 +1,9 @@
-(ns com.clunk.core_test
+(ns clunk.core_test
   #?(:clj
-     (:require [com.clunk.core :as core]
+     (:require [clunk.core :as core]
                [clojure.test :as test])
      :cljs
-     (:require [com.clunk.core :as core]
+     (:require [clunk.core :as core]
                [cljs.test :as test])))
 
 (def messages '({:type :RowDescription, :num-cols 1, :values [{:field-name "name", :table-oid 16397, :column-attr 2, :oid 1043, :data-type-size -1, :type-modifier -1, :format-code 0}]}

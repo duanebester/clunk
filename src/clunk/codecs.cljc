@@ -1,4 +1,4 @@
-(ns com.clunk.codecs
+(ns clunk.codecs
   (:require [helins.binf :as binf]
             [helins.binf.string :as binf.string])
   #?(:clj (:import

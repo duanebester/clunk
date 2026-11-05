@@ -1,10 +1,10 @@
-(ns com.clunk.message-socket
+(ns clunk.message-socket
   (:require [clojure.core.match :as m]
             [clojure.core.async :as async]
-            [com.clunk.pw :as pw]
-            [com.clunk.messages :as messages]
-            [com.clunk.codecs :as codecs]
-            [com.clunk.byte-buffer-socket :as bs]))
+            [clunk.pw :as pw]
+            [clunk.messages :as messages]
+            [clunk.codecs :as codecs]
+            [clunk.byte-buffer-socket :as bs]))
 
 #?(:cljs (enable-console-print!))
 
@@ -86,7 +86,7 @@
 
 ;; Example usage
 (comment
-  ;; clj -M -m cljs.main --target node --output-to ms.js -c com.clunk.message-socket && node ms.js
+  ;; clj -M -m cljs.main --target node --output-to ms.js -c clunk.message-socket && node ms.js
   (def username "jimmy")
   (def password "banana")
   (def database "world")

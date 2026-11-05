@@ -1,8 +1,8 @@
-(ns com.clunk.messages
+(ns clunk.messages
   (:require [clojure.core.match :as m]
             [helins.binf :as binf]
             [helins.binf.buffer :as binf.buffer]
-            [com.clunk.codecs :as codecs]))
+            [clunk.codecs :as codecs]))
 
 (defn handle-backend-key-data [bs]
   (let [id (binf/rr-i32 bs)

@@ -1,4 +1,4 @@
-(ns com.clunk.pw
+(ns clunk.pw
   (:require [clojure.string :as str]
             #?@(:cljs [goog.crypt [cljs.nodejs :as node]]))
   #?(:clj
