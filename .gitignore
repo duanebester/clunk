@@ -13,3 +13,6 @@ scratch/
 
 .vscode/
 .amp/portals/
+
+target/
+.shadow-cljs/

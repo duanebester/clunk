@@ -1,19 +1,16 @@
 (ns clunk.oid-types
-  (:require [clojure.core.match :as m]
-            [clunk.vendor.binf :as binf])
-  #?(:clj (:import
-           (java.nio ByteBuffer))))
+  (:require [clunk.vendor.binf :as binf]))
 
 (defn oid-converter
-  [^Integer oid ^bytes data ^Integer len]
-  (let [bb #?(:clj (ByteBuffer/wrap data)
-              :cljs (js/Uint8Array. data))
-        _ (binf/endian-set bb :big-endian)]
-    (m/match oid
-      16   (binf/rr-bool bb)
-      23   #?(:clj (Integer/parseInt (binf/rr-string bb len))
-              :cljs (js/parseInt (binf/rr-string bb len)))
-      700  (binf/rr-f32 bb)
-      1043 (binf/rr-string bb len)
-      1700 (binf/rr-f64 bb)
-      :else data)))
+  "Decodes one column value. Simple queries always return values in text
+   format, so each type parses its text. Unknown OIDs return the raw bytes."
+  [oid data len]
+  (let [s (binf/rr-string (binf/view data) len)]
+    (case (int oid)
+      16   (= s "t")
+      23   #?(:clj (Integer/parseInt s) :cljs (js/parseInt s 10))
+      700  #?(:clj (Float/parseFloat s) :cljs (js/parseFloat s))
+      1043 s
+      ;; numeric is arbitrary precision; JS has no type that holds it exactly.
+      1700 #?(:clj (bigdec s) :cljs s)
+      data)))

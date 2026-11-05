@@ -11,20 +11,6 @@ Talking to Postgres via sockets. At this point in time, I'm just experimenting w
 
 [![Clojure CI](https://github.com/duanebester/clunk/actions/workflows/clojure.yml/badge.svg?branch=main)](https://github.com/duanebester/clunk/actions/workflows/clojure.yml)
 
-### Running The Tests
-
-You need to have a Postgres Database up and running. clunk authenticates with either MD5 or SCRAM-SHA-256 (the default since Postgres 14).
-
-```bash
-docker compose up -d
-```
-
-Now you can run the [tests](test/clunk/core_test.clj) with
-
-```bash
-clj -X:test
-```
-
 ### Example
 
 ```clj
@@ -33,73 +19,78 @@ clj -X:test
    [clojure.core.async :as async]
    [clunk.core :as clunk]))
 
-(def cfg {:username "jimmy"
-          :password "banana"
-          :database "world"
-          :debug true})
+(def client (clunk/client {:username "jimmy"
+                           :password "banana"
+                           :database "world"}))
+
+;; Authenticates (MD5 or SCRAM-SHA-256). The channel yields the server's
+;; ReadyForQuery message, or an error. Queries made before then wait their turn.
+(async/<!! (clunk/connect client))
 ```
 
-We can now create a client, and connect to the postgres instance:
+`clunk/query` returns a channel of row maps that closes after the last row. Queries on one client run one at a time, in the order they were made.
+
 ```clj
-(def client (clunk/client cfg))
-
-(clunk/connect client)
+(async/go-loop [ch (clunk/query client "SELECT name, region, population FROM country ORDER BY name LIMIT 3;")]
+  (when-let [row (async/<! ch)]
+    (println row)
+    (recur ch)))
+;; {:name Afghanistan, :region Southern and Central Asia, :population 22720000}
+;; {:name Albania, :region Southern Europe, :population 3401200}
+;; {:name Algeria, :region Northern Africa, :population 31471000}
 ```
 
-We will see a bunch of received messages:
+Inside a go block, `<query!` parks until the query finishes and returns all its rows as a vector:
+
 ```clj
-{:type :AuthenticationMD5, :salt #object["[B" 0x5ea94109 "[B@5ea94109"]}
-{:type :AuthenticationOk}
-{:type :ParameterStatus, :param "application_name", :status ""}
-{:type :ParameterStatus, :param "client_encoding", :status "UTF8"}
-{:type :ParameterStatus, :param "DateStyle", :status "ISO, MDY"}
-{:type :ParameterStatus, :param "integer_datetimes", :status "on"}
-{:type :ParameterStatus, :param "IntervalStyle", :status "postgres"}
-{:type :ParameterStatus, :param "is_superuser", :status "on"}
-{:type :ParameterStatus, :param "server_encoding", :status "UTF8"}
-{:type :ParameterStatus, :param "server_version", :status "13.4 (Debian 13.4-1.pgdg100+1)"}
-{:type :ParameterStatus, :param "session_authorization", :status "jimmy"}
-{:type :ParameterStatus, :param "standard_conforming_strings", :status "on"}
-{:type :ParameterStatus, :param "TimeZone", :status "Etc/UTC"}
-{:type :BackendKeyData, :id 239, :key 2031531424}
-{:type :ReadyForQuery, :status 73}
+(async/go
+  (println (clunk/<query! client "SELECT 1::int4 AS one;")))
+;; [{:one 1}]
 ```
 
-Finally we can define and run a query. The `<query!` macro is shorthand for an async take on the channel returned from `clunk/query`. It must be run inside a go block.
-```clj
-(def qs "SELECT name, region, population FROM country ORDER BY name LIMIT 10;")
+A failed query puts an `ex-info` on the channel (check with `clunk/error?`); its `ex-data` holds the Postgres `:code`, `:message`, and `:severity`. The next query still runs.
 
-(async/go-loop
- []
-  (when-let [recv (clunk/<query! client qs)]
-    (println recv)
-    (recur)))
-```
-
-The above async loop prints out the following:
-```clj
-{:name Afghanistan, :region Southern and Central Asia, :population 22720000}
-{:name Albania, :region Southern Europe, :population 3401200}
-{:name Algeria, :region Northern Africa, :population 31471000}
-{:name American Samoa, :region Polynesia, :population 68000}
-{:name Andorra, :region Southern Europe, :population 78000}
-{:name Angola, :region Central Africa, :population 12878000}
-{:name Anguilla, :region Caribbean, :population 8000}
-{:name Antarctica, :region Antarctica, :population 0}
-{:name Antigua and Barbuda, :region Caribbean, :population 68000}
-{:name Argentina, :region South America, :population 37032000}
-```
-
-And lastly, close the client:
 ```clj
 (clunk/close client)
 ```
 
+### Node
+
+The same code compiles to a CommonJS module with a Promise API:
+
+```bash
+clojure -M:cljs release node   # writes target/node/clunk.js
+```
+
+```js
+const clunk = require('./target/node/clunk.js');
+
+const client = await clunk.connect({ username: 'jimmy', password: 'banana', database: 'world' });
+const rows = await clunk.query(client, 'SELECT name FROM country ORDER BY name LIMIT 2');
+// [ { name: 'Afghanistan' }, { name: 'Albania' } ]
+clunk.close(client);
+```
+
+### Running The Tests
+
+The tests need the Postgres from `docker-compose.yml`:
+
+```bash
+docker compose up -d
+```
+
+Run them on the JVM, then on Node:
+
+```bash
+clojure -X:test
+clojure -M:cljs compile test && node target/test/node-tests.js
+```
+
+The ClojureScript build uses shadow-cljs, which needs Java 21 or newer.
+
+clunk has no third-party runtime dependencies: the binary codec, [BinF](https://github.com/helins/binf.cljc), is vendored under [`src/clunk/vendor`](src/clunk/vendor/binf/README.md).
+
 Rough Todo / Help needed
 
-* Build out CLJS test suite
-* Figure out a good way to provide async query results
-* Fix core.async channel closing issues
 * Flush out frontend/backend message parsers
-* Deploy to Clojars
 * Deploy to npm

@@ -31,11 +31,3 @@
     (test/is (not (pw/scram-server-final-valid? final "v=AAAATRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")))
     (test/is (thrown? #?(:clj Exception :cljs js/Error)
                       (pw/scram-client-final (assoc scram :server-first "r=someoneElsesNonce,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"))))))
-
-#?(:cljs
-   (defmethod cljs.test/report [:cljs.test/default :end-run-tests] [m]
-     (if (cljs.test/successful? m)
-       (println "Success!")
-       (println "FAIL"))))
-
-#?(:cljs (cljs.test/run-tests))

@@ -1,0 +1,12 @@
+;; clojure -M:cljs compile node   -> target/node/clunk.js, a CommonJS module
+;; clojure -M:cljs compile test && node target/test/node-tests.js
+;;                                -> runs the .cljc tests on Node
+{:deps   {:aliases [:cljs]}
+ :builds {:node {:target    :node-library
+                 :output-to "target/node/clunk.js"
+                 :exports   {:connect clunk.node/connect
+                             :query   clunk.node/query
+                             :close   clunk.node/close}}
+          :test {:target    :node-test
+                 :output-to "target/test/node-tests.js"
+                 :ns-regexp "-test$"}}}

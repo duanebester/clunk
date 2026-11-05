@@ -36,7 +36,7 @@
          :num-cols cols
          :values   arr}
         (let [len  (binf/rr-i32 bs)
-              data (binf/rr-buffer bs len)]
+              data (when (<= 0 len) (binf/rr-buffer bs len))] ;; -1 is NULL
           (recur (inc i) (conj arr {:idx  i
                                     :data data
                                     :length len})))))))
@@ -75,14 +75,19 @@
        :data (binf/rr-string bs (binf/remaining bs))})))
 
 (defn handle-error
-  ([bs] (handle-error bs []))
-  ([bs errs]
+  "Each field is a type byte and a string; S is severity, C the SQLSTATE code,
+   and M the message."
+  ([bs] (handle-error bs [] {}))
+  ([bs errs fields]
    (let [head (binf/rr-i8 bs)]
      (if (< 0 head)
        (let [msg (codecs/rr-cstring bs)]
-         (handle-error bs (conj errs msg)))
-       {:type   :ErrorMessage
-        :errors errs}))))
+         (recur bs (conj errs msg) (assoc fields (char head) msg)))
+       {:type     :ErrorMessage
+        :errors   errs
+        :severity (get fields \S)
+        :code     (get fields \C)
+        :message  (get fields \M)}))))
 
 (defn handle-close [bs]
   (let [close (binf/rr-i8 bs)

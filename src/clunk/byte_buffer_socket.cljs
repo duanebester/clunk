@@ -2,18 +2,16 @@
   (:require
    [clunk.vendor.binf :as binf]
    [cljs.core.async :as async]
-   [cljs.nodejs :as node]))
+   ["net" :as net]))
 
-(def net (node/require "net"))
-
-(defn connected? [client]
+(defn connected? [^js client]
   (not (and (.-connecting client) (.-destroyed client))))
 
 (defrecord ByteBufferSocket [client in-ch out-ch])
 
 (defn- handle-data
   ([ch d] (handle-data ch d 0))
-  ([ch d offset]
+  ([ch ^js d offset]
    (when (< offset (.-length d))
      (let [_ (.readInt8 d offset)
            len (.readInt32BE d (+ 1 offset))
@@ -22,7 +20,7 @@
        (async/go (async/>! ch buf))
        (handle-data ch d (+ len 1 offset))))))
 
-(defn- init-buffer-socket [client]
+(defn- init-buffer-socket [^js client]
   (let [in-ch      (async/chan)
         out-ch     (async/chan)
         buff-sock  (map->ByteBufferSocket {:client  client
@@ -30,11 +28,12 @@
                                            :out     out-ch})]
 
     (.on client "data" (fn [d] (handle-data in-ch d)))
+    (.on client "close" (fn [_] (async/close! in-ch))) ;; Tell readers the server hung up
 
     (async/go-loop []
       (when (connected? (:client buff-sock))
-        (let [bs (async/<! out-ch)] ;; Receive buffer
-          (.write client (js/Uint8Array. (.-buffer bs))) ;; Send it to SocketChannel
+        (when-let [bs (async/<! out-ch)] ;; nil once out-ch is closed
+          (.write client (js/Uint8Array. (.-buffer bs))) ;; Send it to the socket
           (recur))))
 
     buff-sock))

@@ -1,14 +1,11 @@
 (ns clunk.pw
   (:require [clojure.string :as str]
-            #?@(:cljs [goog.crypt [cljs.nodejs :as node]]))
+            #?@(:cljs [goog.crypt ["crypto" :as crypto]]))
   #?(:clj
      (:import java.security.MessageDigest java.security.SecureRandom java.nio.ByteBuffer
               java.math.BigInteger java.util.Base64
               javax.crypto.Mac javax.crypto.SecretKeyFactory
               javax.crypto.spec.SecretKeySpec javax.crypto.spec.PBEKeySpec)))
-
-#?(:cljs
-   (def crypto (node/require "crypto")))
 
 (defn concat-byte-arrays [^bytes b1 ^bytes b2]
   #?(:clj (when (and (not-empty b1) (not-empty b2))
