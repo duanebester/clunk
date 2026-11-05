@@ -50,8 +50,11 @@
              (t/is (= "42P01" (:code (ex-data err))))
              (t/is (empty? more)))
            (t/is (= [{:n 7}] (clunk/<query! c "SELECT 7::int4 AS n")))
-           (t/is (= [{:b true :f 1.5 :d #?(:clj 12.50M :cljs "12.50")}]
-                    (clunk/<query! c "SELECT true AS b, 1.5::float4 AS f, 12.50::numeric AS d")))
+           (t/is (= [{:b true :f 1.5 :d #?(:clj 12.50M :cljs "12.50") :i -32768 :c "ab  "}]
+                    (clunk/<query! c "SELECT true AS b, 1.5::float4 AS f, 12.50::numeric AS d, (-32768)::int2 AS i, 'ab'::char(4) AS c")))
+           ;; 2^53 + 1 is the first int8 a JS number can't hold.
+           (t/is (= [{:l #?(:clj 9007199254740993 :cljs "9007199254740993") :g 0.1 :t "text"}]
+                    (clunk/<query! c "SELECT 9007199254740993::int8 AS l, 0.1::float8 AS g, 'text'::text AS t")))
            (clunk/close c)))))
 
 (t/deftest a-wrong-password-fails-connect
