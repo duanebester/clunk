@@ -3,7 +3,8 @@
    on the JVM (clojure -X:test) and on Node (clojure -M:cljs compile test)."
   (:require #?(:clj [clojure.test :as t] :cljs [cljs.test :as t])
             [clojure.core.async :as async]
-            [clunk.core :as clunk]))
+            [clunk.core :as clunk])
+  #?(:clj (:import (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZoneOffset))))
 
 (def config {:username "jimmy" :password "banana" :database "world"})
 
@@ -55,6 +56,44 @@
            ;; 2^53 + 1 is the first int8 a JS number can't hold.
            (t/is (= [{:l #?(:clj 9007199254740993 :cljs "9007199254740993") :g 0.1 :t "text"}]
                     (clunk/<query! c "SELECT 9007199254740993::int8 AS l, 0.1::float8 AS g, 'text'::text AS t")))
+           (clunk/close c)))))
+
+(defn- bytes-of [b]
+  (vec #?(:clj b :cljs (js/Uint8Array. b))))
+
+(t/deftest dates-times-bytes-and-text-decode
+  (let [c (clunk/client config)]
+    (run (async/go
+           (async/<! (clunk/connect c))
+           ;; Chicago's offset before 1883 was -05:50:36, which tests offset seconds.
+           (clunk/<query! c "SET TimeZone = 'America/Chicago'")
+           ;; Node reads date and timestamp in local time, as node-postgres does.
+           (t/is (= [#?(:clj {:a (LocalDate/of 2026 11 5) :b (LocalDate/of 99 6 1) :c (LocalDate/of -43 3 15)
+                              :d (LocalDate/of 12345 1 2) :e LocalDate/MAX :f OffsetDateTime/MIN}
+                        :cljs {:a (js/Date. 2026 10 5) :b (js/Date. "0099-06-01T00:00:00") :c (js/Date. "-000043-03-15T00:00:00")
+                               :d (js/Date. "+012345-01-02T00:00:00") :e js/Infinity :f (- js/Infinity)})]
+                    (clunk/<query! c "SELECT '2026-11-05'::date AS a, '0099-06-01'::date AS b, '0044-03-15 BC'::date AS c, '12345-01-02'::date AS d, 'infinity'::date AS e, '-infinity'::timestamptz AS f")))
+           (t/is (= [#?(:clj {:a (LocalDateTime/of 2026 11 5 13 45 1 123456000)
+                              :b (OffsetDateTime/of 2026 11 5 7 45 1 500000000 (ZoneOffset/ofHours -6))
+                              :c (OffsetDateTime/of 1849 12 31 18 9 24 0 (ZoneOffset/ofHoursMinutesSeconds -5 -50 -36))
+                              :d (OffsetDateTime/of -43 3 15 6 9 24 0 (ZoneOffset/ofHoursMinutesSeconds -5 -50 -36))}
+                        :cljs {:a (js/Date. 2026 10 5 13 45 1 123)
+                               :b (js/Date. "2026-11-05T13:45:01.5Z")
+                               :c (js/Date. "1850-01-01T00:00:00Z")
+                               :d (js/Date. "-000043-03-15T12:00:00Z")})]
+                    (clunk/<query! c "SELECT '2026-11-05 13:45:01.123456'::timestamp AS a, '2026-11-05 13:45:01.5+00'::timestamptz AS b, '1850-01-01 00:00+00'::timestamptz AS c, '0044-03-15 12:00+00 BC'::timestamptz AS d")))
+           (let [[row] (clunk/<query! c "SELECT '13:45:01.25'::time AS a, '24:00:00'::time AS b, '13:45:01-05:30'::timetz AS c, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid AS d, '{\"a\":1}'::json AS e, '{\"a\": 1}'::jsonb AS f, 'pg_class'::name AS g, 4294967295::oid AS h, '\\xdeadbeef00'::bytea AS x, ''::bytea AS y")]
+             (t/is (= #?(:clj {:a (LocalTime/of 13 45 1 250000000) :b LocalTime/MAX
+                               :c (OffsetTime/of 13 45 1 0 (ZoneOffset/ofHoursMinutes -5 -30))}
+                         :cljs {:a "13:45:01.25" :b "24:00:00" :c "13:45:01-05:30"})
+                      (select-keys row [:a :b :c])))
+             (t/is (= {:d "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" :e "{\"a\":1}" :f "{\"a\": 1}" :g "pg_class" :h 4294967295}
+                      (select-keys row [:d :e :f :g :h])))
+             (t/is (= #?(:clj [-34 -83 -66 -17 0] :cljs [222 173 190 239 0]) (bytes-of (:x row))))
+             (t/is (= [] (bytes-of (:y row)))))
+           ;; 400 KB arrives over many reads, so it decodes from a reassembled buffer.
+           (let [[{b :b}] (clunk/<query! c "SELECT decode(repeat('00ff7f80', 100000), 'hex') AS b")]
+             (t/is (= (take 400000 (cycle #?(:clj [0 -1 127 -128] :cljs [0 255 127 128]))) (bytes-of b))))
            (clunk/close c)))))
 
 (t/deftest a-wrong-password-fails-connect
