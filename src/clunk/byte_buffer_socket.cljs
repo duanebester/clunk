@@ -1,7 +1,7 @@
 (ns clunk.byte-buffer-socket
   (:require
-   [clunk.vendor.binf :as binf]
    [cljs.core.async :as async]
+   [clunk.framing :as framing]
    ["net" :as net]))
 
 (defn connected? [^js client]
@@ -9,25 +9,23 @@
 
 (defrecord ByteBufferSocket [client in-ch out-ch])
 
-(defn- handle-data
-  ([ch d] (handle-data ch d 0))
-  ([ch ^js d offset]
-   (when (< offset (.-length d))
-     (let [_ (.readInt8 d offset)
-           len (.readInt32BE d (+ 1 offset))
-           bb (.slice (.-buffer d) offset (+ 1 offset len))
-           buf (binf/view bb)]
-       (async/go (async/>! ch buf))
-       (handle-data ch d (+ len 1 offset))))))
+(defn- chunk->buffer
+  "Copies a Node Buffer's bytes into their own ArrayBuffer. A Buffer can be a
+   window into a larger shared pool, so its byteOffset matters."
+  [^js d]
+  (.slice (.-buffer d) (.-byteOffset d) (+ (.-byteOffset d) (.-length d))))
 
 (defn- init-buffer-socket [^js client]
-  (let [in-ch      (async/chan)
+  (let [in-ch      (async/chan 64 (framing/frames)) ;; Whole messages out, whatever was read in
         out-ch     (async/chan)
         buff-sock  (map->ByteBufferSocket {:client  client
                                            :in      in-ch
                                            :out     out-ch})]
 
-    (.on client "data" (fn [d] (handle-data in-ch d)))
+    ;; Pause reading until the chunk is accepted, so a slow reader pushes back on the server.
+    (.on client "data" (fn [d]
+                         (.pause client)
+                         (async/put! in-ch (chunk->buffer d) (fn [_] (.resume client)))))
     (.on client "close" (fn [_] (async/close! in-ch))) ;; Tell readers the server hung up
 
     (async/go-loop []

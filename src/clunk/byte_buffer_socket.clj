@@ -1,55 +1,44 @@
 (ns clunk.byte-buffer-socket
   (:require
    [clojure.core.async :as async]
-   [clojure.tools.logging :as log])
+   [clojure.tools.logging :as log]
+   [clunk.framing :as framing])
   (:import
    (java.nio ByteBuffer)
    (java.nio.channels SocketChannel)
-   (java.net InetSocketAddress)))
+   (java.net InetSocketAddress)
+   (java.util Arrays)))
 
 (defrecord ByteBufferSocket [^SocketChannel client in-ch out-ch])
 
 (defn connected? [^SocketChannel client]
   (and (.isConnected client) (.isOpen client)))
 
-(defn- parse-header [bb]
-  (let [_ (.flip bb)
-        tag (.get bb)
-        len (.getInt bb)]
-    #_(println (str "RECEIVED TAG: " tag ", LENGTH: " len))
-    [tag len]))
+(defn- init-buffer-socket [^SocketChannel client]
+  (let [in-ch     (async/chan 64 (framing/frames)) ;; Whole messages out, whatever was read in
+        out-ch    (async/chan)
+        buff-sock (map->ByteBufferSocket {:client client
+                                          :in     in-ch
+                                          :out    out-ch})]
+    ;; Reads block, so they run on a real thread rather than a go block.
+    (async/thread
+      (let [bb (ByteBuffer/allocate 65536)]
+        (loop []
+          (let [n (try (.read client bb)
+                       (catch java.io.IOException _ -1))] ;; Socket closed under us
+            (if (neg? n)
+              (async/close! in-ch)
+              (let [chunk (Arrays/copyOf (.array bb) n)]
+                (.clear bb)
+                (when (async/>!! in-ch chunk) ;; Blocks while readers are behind
+                  (recur))))))))
 
-(defn- read-message [tag len client]
-  (let [bb (ByteBuffer/allocate (+ 1 len)) ;; Allocate for full message
-        _  (.put bb tag) ;; Add back tag
-        _  (.putInt bb len) ;; Add back length
-        _  (.read client bb)] ;; Read rest of message
-    (.flip bb)))
-
-(defn- init-buffer-socket [client]
-  (let [in-ch      (async/chan)
-        out-ch     (async/chan)
-        header-buf (ByteBuffer/allocate 5)
-        buff-sock  (map->ByteBufferSocket {:client client
-                                           :in      in-ch
-                                           :out     out-ch})]
-    (async/go-loop []
-      (when (connected? client)
-        (let [n (try (.read client header-buf) ;; Read header
-                     (catch java.io.IOException _ -1))] ;; Socket closed under us
-          (when (<= 5 n)
-            (let [[tag len] (parse-header header-buf)]
-              (when (pos? len)
-                (let [bb (read-message tag len client)]
-                  (.clear header-buf)
-                  (when (async/>! in-ch bb) ;; Send to downstream listeners
-                    (recur)))))))))
-
-    (async/go-loop []
-      (when (connected? client)
-        (when-let [bs (async/<! out-ch)] ;; nil once out-ch is closed
+    (async/thread
+      (loop []
+        (when-let [^ByteBuffer bs (async/<!! out-ch)] ;; nil once out-ch is closed
           (.flip bs)
-          (try (.write client bs) ;; Send it to SocketChannel
+          (try (while (.hasRemaining bs)
+                 (.write client bs)) ;; Send it to SocketChannel
                (catch Exception e (log/error e)))
           (recur))))
 
@@ -59,7 +48,6 @@
   [^Integer port ^String address]
   (let [client (SocketChannel/open)
         address (InetSocketAddress. address port)]
-    #_(.configureBlocking client true)
     (.connect client address)
     (init-buffer-socket client)))
 

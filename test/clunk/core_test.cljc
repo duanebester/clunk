@@ -29,6 +29,18 @@
              (t/is (= [{:n nil :s "b"}] (clunk/<query! c "SELECT NULL::int4 AS n, 'b'::varchar AS s")))
              (clunk/close c))))))
 
+(t/deftest a-result-larger-than-one-read-arrives-whole
+  (let [c (clunk/client config)]
+    (run (async/go
+           (async/<! (clunk/connect c))
+           ;; About 2.4 MB: many socket reads, with messages cut across them.
+           (let [rows (clunk/<query! c "SELECT g::int4 AS n, repeat('x', 100)::varchar AS s FROM generate_series(1, 20000) g")]
+             (t/is (= 20000 (count rows)))
+             (t/is (= (range 1 20001) (map :n rows)))
+             (t/is (every? #(= (apply str (repeat 100 "x")) (:s %)) rows)))
+           (t/is (= [{:n 1}] (clunk/<query! c "SELECT 1::int4 AS n")))
+           (clunk/close c)))))
+
 (t/deftest a-failed-query-reports-an-error-and-the-next-one-runs
   (let [c (clunk/client config)]
     (run (async/go
