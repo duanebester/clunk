@@ -8,40 +8,61 @@
   (:require [clunk.vendor.binf :as binf]
             [clunk.vendor.binf.buffer :as buffer]))
 
-(defn- concat-buffers [a b]
-  (let [na (count a)]
-    (if (zero? na)
-      b
-      (-> (buffer/alloc (+ na (count b)))
-          (buffer/copy 0 a 0 na)
-          (buffer/copy na b 0 (count b))))))
+(defn- append [a an b boff bn]
+  (-> (buffer/alloc (+ an bn))
+      (buffer/copy 0 a 0 an)
+      (buffer/copy an b boff bn)))
 
-(defn- slice [buf offset n]
-  (buffer/copy (buffer/alloc n) 0 buf offset n))
+(defn- message-size
+  "Total bytes of the message starting at offset in view: the tag byte plus the
+   int32 length, which counts itself and the body. nil when the header is
+   incomplete."
+  [view offset size]
+  (when (<= (+ offset 5) size)
+    (inc (binf/ra-i32 view (inc offset)))))
 
 (defn frames
   "Transducer from byte chunks (binf buffers: byte arrays on the JVM,
-   ArrayBuffers in JS) to one binf view per complete message. A message is a
-   1-byte tag and a big-endian int32 length that counts itself and the body.
-   Bytes of an unfinished message wait for the next chunk."
+   ArrayBuffers in JS) to one binf view per complete message.
+
+   Each message is a view into the chunk it arrived in, not a copy, so chunks
+   must not be reused after they are put. Only a message cut across two chunks
+   is copied, into a buffer of its own."
   []
   (fn [rf]
-    (let [pending (volatile! (buffer/alloc 0))]
+    ;; Bytes of a message that the previous chunk cut off, waiting for the rest.
+    (let [pending (volatile! nil)]
       (fn
         ([] (rf))
         ([result] (rf result))
         ([result chunk]
-         (let [buf  (concat-buffers @pending chunk)
-               size (count buf)
-               v    (binf/view buf)]
+         (let [size (count chunk)
+               ;; Finish the cut-off message first, taking only the bytes it needs.
+               [result offset]
+               (if-let [head @pending]
+                 (let [hn    (count head)
+                       ;; Up to 5 bytes complete the header, then the size is known.
+                       head  (if (< hn 5) (append head hn chunk 0 (min size (- 5 hn))) head)
+                       taken (- (count head) hn)
+                       total (message-size (binf/view head) 0 (count head))]
+                   (if (nil? total)
+                     (do (vreset! pending head) [result size])
+                     (let [need (min (- size taken) (- total (count head)))
+                           msg  (append head (count head) chunk taken need)]
+                       (if (= (count msg) total)
+                         (do (vreset! pending nil)
+                             [(rf result (binf/view msg)) (+ taken need)])
+                         (do (vreset! pending msg) [result size])))))
+                 [result 0])]
            (loop [result result
-                  offset 0]
-             (let [total (when (<= (+ offset 5) size)
-                           (inc (binf/ra-i32 v (inc offset))))]
-               (if (and total (<= (+ offset total) size))
-                 (let [result (rf result (binf/view (slice buf offset total)))]
-                   (if (reduced? result)
-                     result
-                     (recur result (+ offset total))))
-                 (do (vreset! pending (slice buf offset (- size offset)))
-                     result))))))))))
+                  offset offset
+                  whole  (binf/view chunk)]
+             (cond
+               (reduced? result) result
+               (= offset size)   result
+               :else
+               (let [total (message-size whole offset size)]
+                 (if (and total (<= (+ offset total) size))
+                   (recur (rf result (binf/view chunk offset total)) (+ offset total) whole)
+                   (do (vreset! pending (append chunk 0 chunk offset (- size offset)))
+                       result)))))))))))

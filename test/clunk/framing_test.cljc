@@ -14,9 +14,12 @@
   #?(:clj (byte-array byte-values)
      :cljs (.-buffer (js/Int8Array. (clj->js byte-values)))))
 
-(defn- bytes-of [view]
-  (vec #?(:clj (.array ^java.nio.ByteBuffer view)
-          :cljs (js/Int8Array. (binf/backing-buffer view)))))
+(defn- bytes-of
+  "The bytes a view covers. Views share their chunk, so this reads only the
+   view's own range rather than its backing buffer."
+  [view]
+  (let [buf (binf/ra-buffer view 0 (binf/limit view))]
+    (vec #?(:clj buf :cljs (js/Int8Array. buf)))))
 
 (def messages
   [(message 90 [73])                         ;; ReadyForQuery, 1-byte body

@@ -1,7 +1,8 @@
 (ns clunk.core
   (:require [clojure.core.async :as async]
             [clunk.pw :as pw]
-            [clunk.oid-types :refer [oid-converter]]
+            [clunk.oid-types :as oid-types]
+            [clunk.vendor.binf :as binf]
             [clunk.message-socket :as ms])
   #?(:cljs (:require-macros [clunk.core])))
 
@@ -81,12 +82,24 @@
 
             (recur scram)))))))
 
-(defn- row->map [fields row]
-  (into {} (for [rv (:values row)]
-             (let [field (nth fields (:idx rv))]
-               [(keyword (:field-name field))
-                (when-some [data (:data rv)] ;; nil is SQL NULL
-                  (oid-converter (:oid field) data (:length rv)))]))))
+(defn- row-decoder
+  "From a RowDescription's fields, a function that reads a DataRow's view
+   straight into a row map. Keys and per-column decoders are built once here,
+   not once per row."
+  [fields]
+  (let [ks       (object-array (map (comp keyword :field-name) fields))
+        decoders (object-array (map (comp oid-types/decoder :oid) fields))
+        n        (count fields)]
+    (fn [view]
+      (binf/rr-i16 view) ;; column count, same as the RowDescription's
+      (loop [i 0
+             row (transient {})]
+        (if (< i n)
+          (let [len (binf/rr-i32 view)] ;; -1 is SQL NULL
+            (recur (inc i)
+                   (assoc! row (aget ks i)
+                           (when (<= 0 len) ((aget decoders i) view len)))))
+          (persistent! row))))))
 
 (defn- run-query
   "Sends one simple query and streams its rows to out until the server is
@@ -95,18 +108,18 @@
   (let [in (:in message-socket)]
     (async/go
       (async/>! (:out message-socket) {:type :Query :query sql})
-      (loop [fields nil]
+      (loop [decode-row nil]
         (let [message (async/<! in)]
           (case (:type message)
             nil            (do (async/>! out (error "Connection closed during query" {:sql sql}))
                                (async/close! out))
             :ReadyForQuery (async/close! out)
-            :RowDescription (recur (:values message))
-            :DataRow       (do (async/>! out (row->map fields message))
-                               (recur fields))
+            :RowDescription (recur (row-decoder (:values message)))
+            :DataRow       (do (async/>! out (decode-row (:view message)))
+                               (recur decode-row))
             :ErrorMessage  (do (async/>! out (error (:message message) (assoc message :sql sql)))
-                               (recur fields))
-            (recur fields)))))))
+                               (recur decode-row))
+            (recur decode-row)))))))
 
 (defn connect
   "Starts the connection: authenticates, then serves queued queries one at a

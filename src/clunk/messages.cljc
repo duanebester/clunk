@@ -26,19 +26,12 @@
   [ba]
   (println (map (partial int) ba)))
 
-(defn handle-data-row [bs]
-  (let [cols (binf/rr-i16 bs)]
-    (loop [i      0
-           arr    []]
-      (if (<= cols i)
-        {:type     :DataRow
-         :num-cols cols
-         :values   arr}
-        (let [len  (binf/rr-i32 bs)
-              data (when (<= 0 len) (binf/rr-buffer bs len))] ;; -1 is NULL
-          (recur (inc i) (conj arr {:idx  i
-                                    :data data
-                                    :length len})))))))
+(defn handle-data-row
+  "Leaves the columns undecoded: the query that asked for them knows their
+   types, and decodes them straight from the view (see clunk.core)."
+  [bs]
+  {:type :DataRow
+   :view bs})
 
 (defn handle-row-description [bs]
   (let [cols  (binf/rr-i16 bs)]

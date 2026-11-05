@@ -1,16 +1,20 @@
 (ns clunk.oid-types
   (:require [clunk.vendor.binf :as binf]))
 
-(defn oid-converter
-  "Decodes one column value. Simple queries always return values in text
-   format, so each type parses its text. Unknown OIDs return the raw bytes."
-  [oid data len]
-  (let [s (binf/rr-string (binf/view data) len)]
-    (case (int oid)
-      16   (= s "t")
-      23   #?(:clj (Integer/parseInt s) :cljs (js/parseInt s 10))
-      700  #?(:clj (Float/parseFloat s) :cljs (js/parseFloat s))
-      1043 s
-      ;; numeric is arbitrary precision; JS has no type that holds it exactly.
-      1700 #?(:clj (bigdec s) :cljs s)
-      data)))
+(defn decoder
+  "Returns a function of (view n-byte) that reads one column value of the given
+   type from the view's current position. Simple queries always return values
+   in text format, so each type parses its text. Unknown OIDs return the raw
+   bytes."
+  [oid]
+  (case (int oid)
+    16   (fn [view n] (= "t" (binf/rr-string view n)))
+    23   (fn [view n] #?(:clj (Integer/parseInt (binf/rr-string view n))
+                         :cljs (js/parseInt (binf/rr-string view n) 10)))
+    700  (fn [view n] #?(:clj (Float/parseFloat (binf/rr-string view n))
+                         :cljs (js/parseFloat (binf/rr-string view n))))
+    1043 binf/rr-string
+    ;; numeric is arbitrary precision; JS has no type that holds it exactly.
+    1700 (fn [view n] #?(:clj (bigdec (binf/rr-string view n))
+                         :cljs (binf/rr-string view n)))
+    binf/rr-buffer))
