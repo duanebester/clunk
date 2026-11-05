@@ -8,28 +8,60 @@ on:
 
 jobs:
   test:
+    runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macOS-latest]
-
-    runs-on: ${{ matrix.os }}
+    # The integration tests log in as jimmy/banana to the world database, like docker-compose.yml.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: jimmy
+          POSTGRES_PASSWORD: banana
+          POSTGRES_DB: world
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
-
-      - name: Prepare java
-        uses: actions/setup-java@v2
+        uses: actions/checkout@v7
         with:
-          distribution: 'zulu'
-          java-version: '8'
+          fetch-depth: 0 # build.clj versions the jar by commit count
+
+      # shadow-cljs needs Java 21 or newer.
+      - name: Prepare java
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Prepare node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
 
       - name: Install clojure tools
-        uses: DeLaGuardo/setup-clojure@3.5
+        uses: DeLaGuardo/setup-clojure@13.7.0
         with:
-          cli: 1.10.1.693 # Clojure CLI based on tools.deps
+          cli: 1.12.6.1673
 
-      - name: Execute clojure code on Linux and MacOS
+      - name: Cache dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: deps-${{ hashFiles('deps.edn') }}
+
+      - name: Test on the JVM
         run: clojure -X:test
-        shell: bash
+
+      - name: Test on Node
+        run: clojure -M:cljs compile test && node target/test/node-tests.js
+
+      - name: Build the jar
+        run: clojure -T:build jar

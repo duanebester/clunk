@@ -7,6 +7,10 @@
  :aliases {:dev   {:extra-paths ["src/clunk"]
                    :extra-deps {http-kit/http-kit {:mvn/version "2.1.19"}
                                 org.clojure/data.json {:mvn/version "2.4.0"}}}
+           ;; clojure -T:build jar | install | deploy
+           :build {:deps {io.github.clojure/tools.build {:git/tag "v0.10.14" :git/sha "1176afd"}
+                          slipset/deps-deploy {:mvn/version "0.2.5"}}
+                   :ns-default build}
            ;; clojure -M:cljs compile node | test
            :cljs  {:extra-paths ["test"]
                    :extra-deps {thheller/shadow-cljs {:mvn/version "3.5.11"}}

@@ -88,9 +88,19 @@ clojure -M:cljs compile test && node target/test/node-tests.js
 
 The ClojureScript build uses shadow-cljs, which needs Java 21 or newer.
 
+### Releasing
+
+`build.clj` uses [tools.build](https://github.com/clojure/tools.build) and [deps-deploy](https://github.com/slipset/deps-deploy). The version is `0.0.<commit count>`.
+
+```bash
+clojure -T:build jar       # target/clunk-<version>.jar
+clojure -T:build install   # into ~/.m2
+CLOJARS_USERNAME=... CLOJARS_PASSWORD=... clojure -T:build deploy
+```
+
 clunk has no third-party runtime dependencies: the binary codec, [BinF](https://github.com/helins/binf.cljc), is vendored under [`src/clunk/vendor`](src/clunk/vendor/binf/README.md).
 
 Rough Todo / Help needed
 
 * Flush out frontend/backend message parsers
-* Deploy to npm
+* Publish the Node build to npm
