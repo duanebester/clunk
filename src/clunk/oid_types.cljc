@@ -1,6 +1,6 @@
 (ns clunk.oid-types
   (:require [clojure.core.match :as m]
-            [helins.binf :as binf])
+            [clunk.vendor.binf :as binf])
   #?(:clj (:import
            (java.nio ByteBuffer))))
 

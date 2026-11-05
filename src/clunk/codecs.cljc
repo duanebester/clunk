@@ -1,6 +1,6 @@
 (ns clunk.codecs
-  (:require [helins.binf :as binf]
-            [helins.binf.string :as binf.string])
+  (:require [clunk.vendor.binf :as binf]
+            [clunk.vendor.binf.string :as binf.string])
   #?(:clj (:import
            (java.nio ByteBuffer))))
 

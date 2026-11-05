@@ -1,6 +1,6 @@
 (ns clunk.byte-buffer-socket
   (:require
-   [helins.binf :as binf]
+   [clunk.vendor.binf :as binf]
    [cljs.core.async :as async]
    [cljs.nodejs :as node]))
 
