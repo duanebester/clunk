@@ -3,7 +3,9 @@
    on the JVM (clojure -X:test) and on Node (clojure -M:cljs compile test)."
   (:require #?(:clj [clojure.test :as t] :cljs [cljs.test :as t])
             [clojure.core.async :as async]
-            [clunk.core :as clunk])
+            [clunk.core :as clunk]
+            [clunk.messages :as messages]
+            [clunk.vendor.binf :as binf])
   #?(:clj (:import (clojure.lang ExceptionInfo)
                    (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZoneOffset)
                    (java.util.concurrent ExecutionException))))
@@ -170,6 +172,48 @@
              (t/is (= "22012" (:code (ex-data (last rows))))))
            (t/is (= [{:n 7}] (clunk/<query! c ["SELECT $1::int4 AS n" 7])))
            (clunk/close c)))))
+
+(t/deftest non-ascii-sql-user-and-password-reach-the-server
+  (let [c (clunk/client config)]
+    (run (async/go
+           (async/<! (clunk/connect c))
+           (t/is (= [{:city "Zürich"}] (clunk/<query! c "SELECT 'Zürich' AS city")))
+           (t/is (= [{:s "🦀🐘" :n 8}] (clunk/<query! c "SELECT '🦀🐘' AS s, octet_length('🦀🐘') AS n")))
+           ;; The user name goes in the startup message; SCRAM hashes the password.
+           (clunk/<query! c "DROP ROLE IF EXISTS \"clünk_test\"")
+           (clunk/<query! c "CREATE ROLE \"clünk_test\" LOGIN PASSWORD 'pässwörd'")
+           (let [u (clunk/client {:username "clünk_test" :password "pässwörd" :database "world"})]
+             (async/<! (clunk/connect u))
+             (t/is (= [{:u "clünk_test"}] (clunk/<query! u "SELECT current_user AS u")))
+             (clunk/close u))
+           (clunk/<query! c "DROP ROLE \"clünk_test\"")
+           (clunk/close c)))))
+
+(t/deftest text-converts-to-and-from-a-latin1-database
+  (let [c (clunk/client config)]
+    (run (async/go
+           (async/<! (clunk/connect c))
+           (clunk/<query! c "DROP DATABASE IF EXISTS clunk_latin1 WITH (FORCE)")
+           (clunk/<query! c "CREATE DATABASE clunk_latin1 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0")
+           (let [l (clunk/client (assoc config :database "clunk_latin1"))]
+             (async/<! (clunk/connect l))
+             ;; Read as Latin-1, the UTF-8 bytes would be 7 characters.
+             (t/is (= [{:s "Zürich" :n 6}] (clunk/<query! l "SELECT 'Zürich' AS s, char_length('Zürich') AS n")))
+             (t/is (= "22P05" (:code (ex-data (first (clunk/<query! l "SELECT '🦀' AS s")))))
+                   "LATIN1 has no emoji, so the server rejects it")
+             (clunk/close l))
+           (clunk/<query! c "DROP DATABASE clunk_latin1 WITH (FORCE)")
+           (clunk/close c)))))
+
+(defn- unsigned [view]
+  (mapv #(bit-and % 0xff) (bytes-of (binf/backing-buffer view))))
+
+(t/deftest frontend-messages-are-sized-in-utf-8-bytes
+  ;; "pä🦀" is 3 characters but 1 + 2 + 4 = 7 bytes.
+  (let [s [0x70 0xc3 0xa4 0xf0 0x9f 0xa6 0x80]]
+    (t/is (= (into [0x70 0 0 0 12] (conj s 0)) (unsigned (messages/build-password "pä🦀"))))
+    (t/is (= (into [0x70 0 0 0 17 0x4d 0 0 0 0 7] s) (unsigned (messages/build-sasl-initial-response "M" "pä🦀"))))
+    (t/is (= (into [0x70 0 0 0 11] s) (unsigned (messages/build-sasl-response "pä🦀"))))))
 
 (t/deftest a-wrong-password-fails-connect
   (let [c (clunk/client (assoc config :password "wrong"))]

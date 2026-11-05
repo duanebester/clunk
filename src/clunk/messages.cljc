@@ -89,58 +89,66 @@
 
 (defn build-query
   [^String query]
-  (let [len   (+ (count query) 4 1)
-        bb (binf/view (binf.buffer/alloc (+ 1 len)))]
-    (-> bb
+  (let [q    (binf.string/encode query)
+        len  (+ 4 (count q) 1)
+        view (binf/view (binf.buffer/alloc (+ 1 len)))]
+    (-> view
         (binf/wr-b8 (byte 0x51))
         (binf/wr-b32 (int len))
-        (codecs/wr-cstring query))
-    bb))
+        (codecs/wr-cstring q))
+    view))
 
 (defn build-password
   [^String password]
-  (let [len   (+ (count password) 4 1)
+  (let [pw   (binf.string/encode password)
+        len  (+ 4 (count pw) 1)
         view (binf/view (binf.buffer/alloc (+ 1 len)))]
     (-> view
         (binf/wr-b8 (byte 0x70))
         (binf/wr-b32 (int len))
-        (codecs/wr-cstring password))
+        (codecs/wr-cstring pw))
     view))
 
 (defn build-sasl-initial-response
   [^String mechanism ^String data]
-  (let [len  (+ 4 (count mechanism) 1 4 (count data))
+  (let [m    (binf.string/encode mechanism)
+        d    (binf.string/encode data)
+        len  (+ 4 (count m) 1 4 (count d))
         view (binf/view (binf.buffer/alloc (+ 1 len)))]
     (-> view
         (binf/wr-b8 (byte 0x70))
         (binf/wr-b32 (int len))
-        (codecs/wr-cstring mechanism)
-        (binf/wr-b32 (int (count data)))
-        (binf/wr-string data))
+        (codecs/wr-cstring m)
+        (binf/wr-b32 (int (count d)))
+        (binf/wr-buffer d))
     view))
 
 (defn build-sasl-response
   [^String data]
-  (let [len  (+ 4 (count data))
+  (let [d    (binf.string/encode data)
+        len  (+ 4 (count d))
         view (binf/view (binf.buffer/alloc (+ 1 len)))]
     (-> view
         (binf/wr-b8 (byte 0x70))
         (binf/wr-b32 (int len))
-        (binf/wr-string data))
+        (binf/wr-buffer d))
     view))
 
 (defn build-startup
+  "Asks for UTF8 as the client encoding, since clunk encodes and decodes all
+   text as UTF-8. The server converts to and from the database's encoding, and
+   rejects text that encoding can't hold."
   [^String user ^String database]
-  (let [len   (+ (count user) (count database) 16 4 4 1)
-        view (binf/view (binf.buffer/alloc len))]
+  (let [params (map binf.string/encode ["user" user "database" database
+                                        "client_encoding" "UTF8"])
+        len    (reduce + (+ 4 4 1) (map #(inc (count %)) params))
+        view   (binf/view (binf.buffer/alloc len))]
     (-> view
         (binf/wr-b32 (int len))
-        (binf/wr-b32 (int 196608))
-        (codecs/wr-cstring "user")
-        (codecs/wr-cstring user)
-        (codecs/wr-cstring "database")
-        (codecs/wr-cstring database)
-        (binf/wr-b8 (byte 0x00)))
+        (binf/wr-b32 (int 196608)))
+    (doseq [p params]
+      (codecs/wr-cstring view p))
+    (binf/wr-b8 view (byte 0x00))
     view))
 
 ;; The extended query protocol. clunk uses only the unnamed statement and the

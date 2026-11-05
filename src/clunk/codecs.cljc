@@ -1,9 +1,14 @@
 (ns clunk.codecs
   (:require [clunk.vendor.binf :as binf]))
 
-(defn wr-cstring [view string]
-  (binf/wr-string view (str string "\0"))
-  view)
+(defn wr-cstring
+  "Writes bs, a string already encoded with binf.string/encode, and the NUL
+   that ends it. Builders encode first because Postgres sizes messages in
+   UTF-8 bytes, not characters."
+  [view bs]
+  (-> view
+      (binf/wr-buffer bs)
+      (binf/wr-b8 0)))
 
 (defn rr-cstring [view]
   (let [pos (binf/position view)]
