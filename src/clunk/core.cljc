@@ -4,6 +4,7 @@
             [clunk.oid-types :as oid-types]
             [clunk.vendor.binf :as binf]
             [clunk.message-socket :as ms])
+  #?(:clj (:import (java.util.concurrent CompletableFuture)))
   #?(:cljs (:require-macros [clunk.core])))
 
 ;; A Client owns one connection. Requests queue on :requests, and a single
@@ -150,6 +151,47 @@
     (when-not (async/put! (:requests client) {:sql sql :out out})
       (async/close! out))
     out))
+
+(defn execute
+  "Runs sql and returns all its rows as a vector of maps: a CompletableFuture
+   on the JVM (deref it with @) and a js/Promise in ClojureScript. A failed
+   query fails it with the error."
+  [client sql]
+  (let [settle (fn [ok fail]
+                 (async/take! (async/into [] (query client sql))
+                              (fn [rows]
+                                (if-let [err (first (filter error? rows))]
+                                  (fail err)
+                                  (ok rows)))))]
+    #?(:clj  (let [cf (CompletableFuture.)]
+               (settle #(.complete cf %) #(.completeExceptionally cf %))
+               cf)
+       :cljs (js/Promise. settle))))
+
+#?(:clj
+   (defn plan
+     "Returns a reducible that runs sql each time it is reduced and hands each
+      row to the reducing function as it arrives, so the rows are never all in
+      memory. Works with reduce, transduce, into and run!; a reduced value, as
+      from take, stops early. A failed query throws its error. It blocks the
+      reducing thread, so don't reduce it inside a go block."
+     [client sql]
+     (reify clojure.lang.IReduceInit
+       (reduce [_ f init]
+         (let [ch (query client sql)]
+           (try
+             (loop [acc init]
+               (let [row (async/<!! ch)]
+                 (cond
+                   (nil? row)   acc
+                   (error? row) (throw row)
+                   :else        (let [acc (f acc row)]
+                                  (if (reduced? acc) @acc (recur acc))))))
+             (finally
+               ;; A put already parked on ch outlives close!, so drain the rest
+               ;; or the session loop stalls and every later query waits.
+               (async/close! ch)
+               (async/go-loop [] (when (async/<! ch) (recur))))))))))
 
 (defmacro <query!
   "Inside a go block, parks until the query finishes and returns a vector of

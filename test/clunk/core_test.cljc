@@ -4,7 +4,9 @@
   (:require #?(:clj [clojure.test :as t] :cljs [cljs.test :as t])
             [clojure.core.async :as async]
             [clunk.core :as clunk])
-  #?(:clj (:import (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZoneOffset))))
+  #?(:clj (:import (clojure.lang ExceptionInfo)
+                   (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZoneOffset)
+                   (java.util.concurrent ExecutionException))))
 
 (def config {:username "jimmy" :password "banana" :database "world"})
 
@@ -57,6 +59,24 @@
            (t/is (= [{:l #?(:clj 9007199254740993 :cljs "9007199254740993") :g 0.1 :t "text"}]
                     (clunk/<query! c "SELECT 9007199254740993::int8 AS l, 0.1::float8 AS g, 'text'::text AS t")))
            (clunk/close c)))))
+
+#?(:clj
+   (t/deftest execute-returns-a-future-and-plan-a-reducible
+     (let [c (clunk/client config)]
+       (async/<!! (clunk/connect c))
+       (t/is (= [{:n 1} {:n 2}] @(clunk/execute c "SELECT generate_series(1, 2)::int4 AS n")))
+       (let [err (try @(clunk/execute c "SELECT * FROM no_such_table")
+                      (catch ExecutionException e (ex-cause e)))]
+         (t/is (= "42P01" (:code (ex-data err)))))
+       (t/is (= 5050 (transduce (map :n) + 0 (clunk/plan c "SELECT generate_series(1, 100)::int4 AS n"))))
+       (t/is (thrown-with-msg? ExceptionInfo #"no_such_table" (into [] (clunk/plan c "SELECT * FROM no_such_table"))))
+       ;; The pause lets the client fill the row buffer before the reduce stops,
+       ;; so stopping early must still let the next query run.
+       (t/is (= {:n 1} (reduce (fn [_ row] (Thread/sleep 200) (reduced row))
+                               nil
+                               (clunk/plan c "SELECT generate_series(1, 1000)::int4 AS n"))))
+       (t/is (= [{:n 7}] (deref (clunk/execute c "SELECT 7::int4 AS n") 5000 :timed-out)))
+       (clunk/close c))))
 
 (defn- bytes-of [b]
   (vec #?(:clj b :cljs (js/Uint8Array. b))))
