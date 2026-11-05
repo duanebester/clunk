@@ -1,8 +1,5 @@
 (ns clunk.codecs
-  (:require [clunk.vendor.binf :as binf]
-            [clunk.vendor.binf.string :as binf.string])
-  #?(:clj (:import
-           (java.nio ByteBuffer))))
+  (:require [clunk.vendor.binf :as binf]))
 
 (defn wr-cstring [view string]
   (binf/wr-string view (str string "\0"))
@@ -12,11 +9,7 @@
   (let [pos (binf/position view)]
     (loop []
       (if (zero? (binf/rr-u8 view))
-        (let [bb (binf/ra-buffer view pos (- (binf/position view) pos 1))]
-          (.toString
-           (.decode binf.string/decoder-utf-8
-                    #?(:clj (ByteBuffer/wrap bb)
-                       :cljs (js/Uint8Array. bb)))))
+        (binf/ra-string view pos (- (binf/position view) pos 1))
         (recur)))))
 
 (defn rr-header

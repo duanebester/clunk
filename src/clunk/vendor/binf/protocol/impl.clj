@@ -32,7 +32,7 @@
   (let [position (.position bb)]
     (.position bb
                0)
-    (let [bigger-view (doto (bb-alloc (+ (binf.protocol/limit bb)
+    (let [bigger-view (doto ^ByteBuffer (bb-alloc (+ (binf.protocol/limit bb)
                                          n-additional-byte))
                         (.put bb)
                         (.position position)
@@ -62,7 +62,7 @@
     (ra-buffer [this position n-byte buffer offset]
       (let [position-cache (.position this)]
         (.position this
-                   position)
+                   (int position))
         (.get this
               ^bytes buffer
               offset
@@ -116,9 +116,9 @@
       (.toString (.decode ^Charset decoder
                           (-> this
                               .duplicate
-                              (.position position)
-                              (.limit (+ position
-                                         n-byte))))))
+                              (.position (int position))
+                              (.limit (int (+ position
+                                              n-byte)))))))
 
 
   binf.protocol/IAbsoluteWriter
@@ -126,7 +126,7 @@
     (wa-buffer [this position buffer offset n-byte]
       (let [position-cache (.position this)]
         (.position this
-                   position)
+                   (int position))
         (.put this
               ^bytes buffer
               offset
@@ -137,7 +137,7 @@
 
     (wa-b8 [this position integer]
       (.put this
-            position
+            (int position)
             (unchecked-byte integer))
       this)
 
@@ -174,7 +174,7 @@
     (wa-string [this position string]
       (let [saved-position (.position this)]
         (.position this
-                   position)
+                   (int position))
         (let [res (binf.protocol/wr-string this
                                            string)]
           (.position this
@@ -261,8 +261,8 @@
       (let [string (.toString (.decode ^Charset decoder
                                        (-> this
                                            .duplicate
-                                           (.limit (+ (.position this)
-                                                        n-byte)))))]
+                                           (.limit (int (+ (.position this)
+                                                             n-byte))))))]
         (binf.protocol/skip this
                             n-byte)
         string))
@@ -357,13 +357,13 @@
 
     (seek [this position]
       (.position this
-                 position)
+                 (int position))
       this)
 
     (skip [this n-byte]
       (.position this
-                 (+ (.position this)
-                    n-byte))
+                 (int (+ (.position this)
+                         n-byte)))
       this)
 
 
@@ -381,14 +381,13 @@
       ([this offset]
        (doto (-> this
                  .duplicate
-                 (.position offset)
+                 (.position (int offset))
                  .slice)
          (.order (.order this))))
 
       ([this offset n-byte]
-        (-> this
-            (binf.protocol/view offset)
-            (.limit n-byte)))))
+        (-> ^ByteBuffer (binf.protocol/view this offset)
+            (.limit (int n-byte))))))
 
 
 ;;;;;;;;;; Creating views from byte arrays
@@ -411,7 +410,7 @@
 
       ([this offset]
        (-> (ByteBuffer/wrap this)
-           (.position offset)
+           (.position (int offset))
            .slice))
 
       ([this offset n-byte]
