@@ -47,15 +47,68 @@ To handle rows as they arrive, without holding them all in memory, reduce `plan`
 ;; ["A Coruña (La Coruña)" "Aachen"]
 ```
 
+#### In a Ring handler
+
+On Java 21+, http-kit 2.8 runs handlers on virtual threads, where blocking on `@` costs next to nothing:
+
+```clj
+(require '[clojure.data.json :as json])
+
+(defn countries [_request]
+  {:status  200
+   :headers {"content-type" "application/json"}
+   :body    (json/write-str @(clunk/execute client "SELECT name, population FROM country ORDER BY population DESC LIMIT 3"))})
+```
+
+To stream a large result, hand `plan` to a response body. With the Ring Jetty adapter, this writes newline-delimited JSON as rows arrive. A slow reader slows the query, and a reader that disconnects lets the next query run. (http-kit doesn't support Ring's `StreamableResponseBody`.)
+
+```clj
+(require '[clojure.java.io :as io]
+         '[ring.core.protocols :as ring])
+
+(defn ndjson [rows]
+  (reify ring/StreamableResponseBody
+    (write-body-to-stream [_ _ out]
+      (with-open [w (io/writer out)]
+        (run! #(.write w (str (json/write-str %) "\n")) rows)))))
+
+(defn cities [_request]
+  {:status  200
+   :headers {"content-type" "application/x-ndjson"}
+   :body    (ndjson (clunk/plan client "SELECT name, population FROM city"))})
+```
+
+In an asynchronous Ring handler, complete the response from the future. Clojure 1.12 passes the `fn` as the `BiConsumer` that `whenComplete` takes:
+
+```clj
+(defn countries-async [_request respond raise]
+  (.whenComplete (clunk/execute client "SELECT name FROM country ORDER BY name")
+                 (fn [rows err]
+                   (if err
+                     (raise err)
+                     (respond {:status 200 :body (json/write-str rows)})))))
+```
+
 #### core.async
 
-`clunk/query` returns a channel of row maps that closes after the last row. A failed query puts an `ex-info` on the channel (check with `clunk/error?`) instead of throwing. If you stop reading early, close the channel *and* keep taking from it until it closes, or the client waits for you before running its next query.
+`clunk/query` returns a channel of row maps that closes after the last row. A failed query puts an `ex-info` on the channel (check with `clunk/error?`) instead of throwing.
 
 ```clj
 (async/go-loop [ch (clunk/query client "SELECT name FROM country ORDER BY name LIMIT 3;")]
   (when-let [row (async/<! ch)]
     (println row)
     (recur ch)))
+```
+
+To stop early, pass a `:cancel` channel and close it. The row channel closes, and the client skips the rest of the result before running the next query. A `timeout` channel works as a time limit. Closing the row channel yourself isn't enough, because the client may already be waiting to put the next row on it.
+
+```clj
+(let [cancel (async/promise-chan)
+      rows   (clunk/query client "SELECT * FROM city" {:cancel cancel})]
+  (println (async/<!! rows))
+  (async/close! cancel))
+
+(clunk/query client "SELECT * FROM city" {:cancel (async/timeout 1000)})
 ```
 
 Inside a go block, `<query!` parks until the query finishes and returns all its rows as a vector:
@@ -95,6 +148,13 @@ for await (const row of clunk.stream(client, 'SELECT name, population FROM city 
 clunk.close(client);
 ```
 
+`Array.fromAsync` collects a stream into an array:
+
+```js
+const names = await Array.fromAsync(clunk.stream(client, 'SELECT name FROM country ORDER BY name LIMIT 3'));
+// [ { name: 'Afghanistan' }, { name: 'Albania' }, { name: 'Algeria' } ]
+```
+
 A failed query rejects with an `Error` that has the Postgres `code` and `severity`, and the `sql`, as properties, as node-postgres errors do.
 
 `stream` returns an async iterable, so `Readable.from` turns it into a Node stream. In an Express 5 handler, this streams rows as newline-delimited JSON. It waits while the HTTP client reads slowly, and lets the next query run if the HTTP client disconnects:
@@ -108,6 +168,22 @@ app.get('/cities', async (req, res) => {
   const toLine = new Transform({ objectMode: true, transform: (row, _, cb) => cb(null, JSON.stringify(row) + '\n') });
   await pipeline(Readable.from(clunk.stream(client, 'SELECT * FROM city')), toLine, res);
 });
+```
+
+Servers built on the web `fetch` API, such as Hono, take a `Response` whose body is a web `ReadableStream`, and `ReadableStream.from` accepts the same async iterable. When the client disconnects, the server cancels the body, which stops the stream:
+
+```js
+import { Hono } from 'hono';
+import { serve } from '@hono/node-server';
+
+const app = new Hono();
+app.get('/cities', () => {
+  const body = ReadableStream.from(clunk.stream(client, 'SELECT name, population FROM city'))
+    .pipeThrough(new TransformStream({ transform: (row, out) => out.enqueue(JSON.stringify(row) + '\n') }))
+    .pipeThrough(new TextEncoderStream());
+  return new Response(body, { headers: { 'content-type': 'application/x-ndjson' } });
+});
+serve({ fetch: app.fetch, port: 3000 });
 ```
 
 ### Running The Tests

@@ -78,6 +78,20 @@
        (t/is (= [{:n 7}] (deref (clunk/execute c "SELECT 7::int4 AS n") 5000 :timed-out)))
        (clunk/close c))))
 
+(t/deftest a-cancelled-query-closes-early-and-the-next-one-runs
+  (let [c (clunk/client config)]
+    (run (async/go
+           (async/<! (clunk/connect c))
+           (let [cancel (async/promise-chan)
+                 ch     (clunk/query c "SELECT generate_series(1, 1000)::int4 AS n" {:cancel cancel})]
+             (t/is (= {:n 1} (async/<! ch)))
+             ;; By now the client has filled ch and waits to put the next row.
+             (async/<! (async/timeout 200))
+             (async/close! cancel)
+             (t/is (= [{:n 7}] (clunk/<query! c "SELECT 7::int4 AS n")))
+             (t/is (> 999 (count (async/<! (async/into [] ch))))))
+           (clunk/close c)))))
+
 (defn- bytes-of [b]
   (vec #?(:clj b :cljs (js/Uint8Array. b))))
 

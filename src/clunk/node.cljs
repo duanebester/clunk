@@ -37,23 +37,20 @@
    Readable.from. Leaving early (break, or a destroyed stream) lets the next
    query run. A failed query rejects."
   [client sql]
-  (let [ch   (clunk/query client sql)
-        ;; A put already parked on ch outlives close!, so drain the rest or the
-        ;; session loop stalls and every later query waits.
-        stop (fn []
-               (async/close! ch)
-               (async/go-loop [] (when (async/<! ch) (recur))))
-        it   #js {:next   (fn []
-                            (js/Promise.
-                             (fn [resolve reject]
-                               (async/take! ch (fn [row]
-                                                 (cond
-                                                   (nil? row)         (resolve #js {:done true})
-                                                   (clunk/error? row) (do (stop) (reject (js-error row)))
-                                                   :else              (resolve #js {:done false :value (clj->js row)})))))))
-                  :return (fn []
-                            (stop)
-                            (js/Promise.resolve #js {:done true}))}]
+  (let [cancel (async/promise-chan)
+        ch     (clunk/query client sql {:cancel cancel})
+        stop   #(async/close! cancel)
+        it     #js {:next   (fn []
+                              (js/Promise.
+                               (fn [resolve reject]
+                                 (async/take! ch (fn [row]
+                                                   (cond
+                                                     (nil? row)         (resolve #js {:done true})
+                                                     (clunk/error? row) (do (stop) (reject (js-error row)))
+                                                     :else              (resolve #js {:done false :value (clj->js row)})))))))
+                    :return (fn []
+                              (stop)
+                              (js/Promise.resolve #js {:done true}))}]
     (aset it js/Symbol.asyncIterator (fn [] it))
     it))
 

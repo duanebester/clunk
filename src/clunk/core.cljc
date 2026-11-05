@@ -104,23 +104,25 @@
 
 (defn- run-query
   "Sends one simple query and streams its rows to out until the server is
-   ready again. Errors go to out as values; out is always closed."
+   ready again. Errors go to out as values; out is always closed. Once out is
+   closed, it reads and discards the rest of the result."
   [{:keys [message-socket]} {:keys [sql out]}]
   (let [in (:in message-socket)]
     (async/go
       (async/>! (:out message-socket) {:type :Query :query sql})
-      (loop [decode-row nil]
+      ;; live? turns false at the first put that out refuses because it's closed.
+      (loop [decode-row nil
+             live?      true]
         (let [message (async/<! in)]
           (case (:type message)
-            nil            (do (async/>! out (error "Connection closed during query" {:sql sql}))
+            nil            (do (when live?
+                                 (async/>! out (error "Connection closed during query" {:sql sql})))
                                (async/close! out))
             :ReadyForQuery (async/close! out)
-            :RowDescription (recur (row-decoder (:values message)))
-            :DataRow       (do (async/>! out (decode-row (:view message)))
-                               (recur decode-row))
-            :ErrorMessage  (do (async/>! out (error (:message message) (assoc message :sql sql)))
-                               (recur decode-row))
-            (recur decode-row)))))))
+            :RowDescription (recur (row-decoder (:values message)) live?)
+            :DataRow       (recur decode-row (and live? (async/>! out (decode-row (:view message)))))
+            :ErrorMessage  (recur decode-row (and live? (async/>! out (error (:message message) (assoc message :sql sql)))))
+            (recur decode-row live?)))))))
 
 (defn connect
   "Starts the connection: authenticates, then serves queued queries one at a
@@ -145,12 +147,25 @@
 
 (defn query
   "Queues sql and returns a channel of row maps, keyed by column name, that
-   closes after the last row. A failed query puts an error on the channel."
-  [^Client client sql]
-  (let [out (async/chan 64)]
-    (when-not (async/put! (:requests client) {:sql sql :out out})
-      (async/close! out))
-    out))
+   closes after the last row. A failed query puts an error on the channel.
+
+   To stop early, pass a :cancel channel, such as a promise-chan or a timeout,
+   and close it or put on it: the returned channel closes and the client
+   discards the rest of the result. Closing the returned channel alone can
+   leave the client waiting to put a row, holding up every later query."
+  ([client sql] (query client sql nil))
+  ([^Client client sql {:keys [cancel]}]
+   (let [out (async/chan 64)]
+     (if (async/put! (:requests client) {:sql sql :out out})
+       (when cancel
+         ;; A put already parked on out outlives close!, so take until out is
+         ;; empty; run-query's next put is refused and it stops sending rows.
+         (async/go
+           (async/<! cancel)
+           (async/close! out)
+           (loop [] (when (async/<! out) (recur)))))
+       (async/close! out))
+     out)))
 
 (defn execute
   "Runs sql and returns all its rows as a vector of maps: a CompletableFuture
@@ -178,7 +193,8 @@
      [client sql]
      (reify clojure.lang.IReduceInit
        (reduce [_ f init]
-         (let [ch (query client sql)]
+         (let [cancel (async/promise-chan)
+               ch     (query client sql {:cancel cancel})]
            (try
              (loop [acc init]
                (let [row (async/<!! ch)]
@@ -188,10 +204,7 @@
                    :else        (let [acc (f acc row)]
                                   (if (reduced? acc) @acc (recur acc))))))
              (finally
-               ;; A put already parked on ch outlives close!, so drain the rest
-               ;; or the session loop stalls and every later query waits.
-               (async/close! ch)
-               (async/go-loop [] (when (async/<! ch) (recur))))))))))
+               (async/close! cancel))))))))
 
 (defmacro <query!
   "Inside a go block, parks until the query finishes and returns a vector of
