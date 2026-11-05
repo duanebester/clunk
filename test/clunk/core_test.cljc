@@ -148,7 +148,8 @@
     (run (async/go
            (async/<! (clunk/connect c))
            ;; The server infers $1's type from the column it is compared with.
-           (t/is (= [{:name "United States"}] (clunk/<query! c ["SELECT name FROM country WHERE code = $1" "USA"])))
+           (t/is (= [{:name "United States"}]
+                    (clunk/<query! c ["SELECT name FROM (VALUES ('USA'::text, 'United States'::text), ('FRA', 'France')) AS country(code, name) WHERE code = $1" "USA"])))
            ;; Zürich is 6 characters in 7 bytes.
            (t/is (= [{:a 42 :b "Zürich" :n 6 :c true :d nil :e #?(:clj 12.50M :cljs "12.50")}]
                     (clunk/<query! c ["SELECT $1::int4 AS a, $2::text AS b, length($2::text) AS n, $3::bool AS c, $4::int4 AS d, $5::numeric AS e"
