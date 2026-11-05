@@ -2,6 +2,7 @@
 # Prepares an Amp orb (Debian 12) for clunk: JDK, Clojure CLI, Maven/git deps,
 # and a local Postgres 18 seeded with the "world" database the README and
 # example use (user jimmy / password banana / db world on localhost:5432).
+# JDK 21 (Temurin) because shadow-cljs refuses Java 17.
 # Postgres 18 authenticates with SCRAM-SHA-256 by default.
 set -euo pipefail
 
@@ -21,7 +22,7 @@ timed() {
 }
 
 install_apt_packages() {
-  local packages=(openjdk-17-jdk-headless rlwrap "postgresql-$PG_MAJOR" "postgresql-client-$PG_MAJOR")
+  local packages=(temurin-21-jdk rlwrap "postgresql-$PG_MAJOR" "postgresql-client-$PG_MAJOR")
   local missing=()
   for pkg in "${packages[@]}"; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
@@ -39,8 +40,24 @@ install_apt_packages() {
     echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" |
       sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
   fi
+  # Debian 12 has no OpenJDK 21; Adoptium's Temurin does.
+  if [ ! -f /etc/apt/sources.list.d/adoptium.list ]; then
+    sudo install -d /etc/apt/keyrings
+    curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public |
+      sudo gpg --dearmor --yes -o /etc/apt/keyrings/adoptium.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" |
+      sudo tee /etc/apt/sources.list.d/adoptium.list >/dev/null
+  fi
   sudo apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}"
+}
+
+remove_old_jdk() {
+  # Older snapshots carry OpenJDK 17; drop it so java is unambiguously 21.
+  if dpkg -s openjdk-17-jre-headless >/dev/null 2>&1; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq 'openjdk-17-*' >/dev/null
+  fi
+  java -version 2>&1 | head -1
 }
 
 install_clojure() {
@@ -58,11 +75,17 @@ install_clojure() {
 }
 
 fetch_deps() {
-  # Downloads Maven deps and the git-based cognitect test-runner for every alias.
-  # Prefetch each alias on its own: combined, :dev's data.json would mask the
-  # version the test runner resolves alone.
-  clojure -P -M:dev
-  clojure -P -X:test
+  # Downloads Maven and git deps for each alias deps.edn defines. Prefetch each
+  # alias on its own: combined, :dev's data.json would mask the version the
+  # test runner resolves alone.
+  local aliases
+  aliases="$(clojure -X:deps aliases)"
+  has_alias() { grep -q "^:$1 .*project" <<<"$aliases"; }
+  has_alias dev && clojure -P -M:dev
+  has_alias test && clojure -P -X:test
+  has_alias cljs && clojure -P -M:cljs # shadow-cljs
+  has_alias build && clojure -P -T:build # tools.build + deps-deploy
+  return 0
 }
 
 setup_postgres() {
@@ -98,8 +121,9 @@ setup_postgres() {
   echo "    countries: $(PGPASSWORD="$PG_PASSWORD" psql -qtA -h localhost -U "$PG_USER" -d "$PG_DB" -c 'SELECT count(*) FROM country')"
 }
 
-step "Installing apt packages (JDK 17, Postgres $PG_MAJOR)"
+step "Installing apt packages (JDK 21, Postgres $PG_MAJOR)"
 timed install_apt_packages
+timed remove_old_jdk
 
 step "Installing Clojure CLI $CLOJURE_VERSION"
 timed install_clojure
