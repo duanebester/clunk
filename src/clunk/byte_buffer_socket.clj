@@ -24,7 +24,10 @@
           (let [n (try (.read client bb)
                        (catch java.io.IOException _ -1))] ;; Socket closed under us
             (if (neg? n)
-              (async/close! in-ch)
+              ;; Close the socket first, so connected? is false by the time
+              ;; readers see in-ch close.
+              (do (.close client)
+                  (async/close! in-ch))
               (let [chunk (Arrays/copyOf (.array bb) (int n))]
                 (.clear bb)
                 (when (async/>!! in-ch chunk) ;; Blocks while readers are behind
@@ -36,6 +39,9 @@
           (.flip bs)
           (try (while (.hasRemaining bs)
                  (.write client bs)) ;; Send it to SocketChannel
+               ;; A connection the server closed fails its write; the read
+               ;; loop already reports that to the query, so it's only debug.
+               (catch java.io.IOException e (log/debug e "Write to a closed connection"))
                (catch Exception e (log/error e)))
           (recur))))
 

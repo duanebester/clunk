@@ -49,3 +49,22 @@
         (t/is (instance? js/Error err))
         (t/is (= "28P01" (.-code err))))
       (done))))
+
+(t/deftest a-pool-takes-the-place-of-a-client
+  (t/async done
+    (async/go
+      (let [p (node/pool (js/Object.assign #js {:maxSize 1} config))]
+        (t/is (= [{"n" 1} {"n" 2}] (js->clj (<p! (node/query p "SELECT generate_series(1, 2)::int4 AS n")))))
+        ;; Leaving a stream between portal batches gives the only connection
+        ;; back, and the next query on it works.
+        (let [before (get (first (js->clj (<p! (node/query p "SELECT pg_backend_pid() AS pid")))) "pid")
+              it     (node/stream p "SELECT generate_series(1, $1)::int4 AS n" #js [5000])]
+          (t/is (= {"n" 1} (js->clj (.-value (<p! (.next it))))))
+          (async/<! (async/timeout 200))
+          (<p! (.return it))
+          (let [[rows] (async/alts! [(async/go (<p! (node/query p "SELECT pg_backend_pid() AS pid, $1::int4 + 1 AS n" #js [6])))
+                                     (async/timeout 5000)])]
+            (t/is (= [{"pid" before "n" 7}] (js->clj rows)))))
+        (node/close p)
+        (t/is (= "Pool is closed" (.-message (async/<! (rejection (node/query p "SELECT 1")))))))
+      (done))))

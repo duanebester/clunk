@@ -3,8 +3,11 @@
    [cljs.core.async :as async]
    ["net" :as net]))
 
-(defn connected? [^js client]
-  (not (and (.-connecting client) (.-destroyed client))))
+(defn connected?
+  "True until the socket is destroyed, as it is once the server hangs up.
+   Writes made while it is still connecting are buffered."
+  [^js client]
+  (not (.-destroyed client)))
 
 (defrecord ByteBufferSocket [client in-ch out-ch])
 
@@ -24,6 +27,9 @@
                          (.pause client)
                          (async/put! in-ch (chunk->buffer d) (fn [_] (.resume client)))))
     (.on client "close" (fn [_] (async/close! in-ch))) ;; Tell readers the server hung up
+    ;; An unhandled "error" (refused, reset) would crash the process; the
+    ;; "close" that follows it ends the connection instead.
+    (.on client "error" (fn [_]))
 
     (async/go-loop []
       (when (connected? (:client buff-sock))

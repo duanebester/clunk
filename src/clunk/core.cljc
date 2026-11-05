@@ -7,10 +7,31 @@
   #?(:clj (:import (java.util.concurrent CompletableFuture)))
   #?(:cljs (:require-macros [clunk.core])))
 
+(defprotocol Queryable
+  "What query, execute and plan run sql on: a Client, or a pool of clients
+   (clunk.pool)."
+  (submit [this request]
+    "Queues request, a map with :sql, :params, :fetch-size, :out (the row
+     channel), :cancel (the caller's cancel channel, or nil) and :cancelled
+     (an atom that turns true once query's watcher has seen cancel fire), to
+     run on a connection.
+     Closes :out at once if it can't. A request's optional :done function is
+     called once the query has finished on its connection.")
+  (close [this]
+    "Closes the connection, or every connection of a pool."))
+
 ;; A Client owns one connection. Requests queue on :requests, and a single
 ;; session loop (started by connect) is the only reader of the socket, so
 ;; queries run one at a time in the order they were made.
-(defrecord Client [message-socket config requests])
+(defrecord Client [message-socket config requests]
+  Queryable
+  (submit [_ request]
+    (when-not (async/put! requests request)
+      (async/close! (:out request))))
+  (close [this]
+    (async/close! requests)
+    (ms/close-message-socket message-socket)
+    (assoc this :message-socket nil :requests nil)))
 
 (defn client [config]
   (let [host     (get config :hostname "localhost")
@@ -172,13 +193,15 @@
           (loop []
             (when-let [request (async/<! (:requests client))]
               (async/<! (run-query client request))
+              (when-let [done (:done request)]
+                (done))
               (recur))))))
     ready))
 
 (defn query
-  "Queues a query and returns a channel of row maps, keyed by column name,
-   that closes after the last row. A failed query puts an error on the
-   channel.
+  "Queues a query on a client or a pool and returns a channel of row maps,
+   keyed by column name, that closes after the last row. A failed query puts
+   an error on the channel.
 
    sql is a string, or a vector of a statement and the values of its
    parameters $1, $2, ..., as in [\"SELECT * FROM city WHERE id = $1\" 42].
@@ -186,35 +209,39 @@
 
    To stop early, pass a :cancel channel, such as a promise-chan or a timeout,
    and close it or put on it: the returned channel closes and the client
-   discards the rest of the result. Closing the returned channel alone can
+   discards the rest of the result. A query still waiting for a pool's
+   connection doesn't run at all. Closing the returned channel alone can
    leave the client waiting to put a row, holding up every later query.
 
    With :cancel, the server sends the rows in batches of :fetch-size (1000
    unless given), so cancelling also stops the server after the current
    batch. Such a query, like one with parameters, is one statement."
   ([client sql] (query client sql nil))
-  ([^Client client sql {:keys [cancel fetch-size]}]
-   (let [out     (async/chan 64)
-         request {:sql        (if (string? sql) sql (first sql))
-                  :params     (when-not (string? sql) (mapv oid-types/param-text (rest sql)))
-                  :fetch-size (or fetch-size (if cancel default-fetch-size 0))
-                  :out        out}]
-     (if (async/put! (:requests client) request)
-       (when cancel
-         ;; A put already parked on out outlives close!, so take until out is
-         ;; empty; run-query's next put is refused and it stops sending rows.
-         (async/go
-           (async/<! cancel)
-           (async/close! out)
-           (loop [] (when (async/<! out) (recur)))))
-       (async/close! out))
+  ([client sql {:keys [cancel fetch-size]}]
+   (let [out       (async/chan 64)
+         cancelled (atom false)
+         request   {:sql        (if (string? sql) sql (first sql))
+                    :params     (when-not (string? sql) (mapv oid-types/param-text (rest sql)))
+                    :fetch-size (or fetch-size (if cancel default-fetch-size 0))
+                    :out        out
+                    :cancel     cancel
+                    :cancelled  cancelled}]
+     (when cancel
+       ;; A put already parked on out outlives close!, so take until out is
+       ;; empty; run-query's next put is refused and it stops sending rows.
+       (async/go
+         (async/<! cancel)
+         (reset! cancelled true)
+         (async/close! out)
+         (loop [] (when (async/<! out) (recur)))))
+     (submit client request)
      out)))
 
 (defn execute
-  "Runs sql, a string or a vector of a statement and its parameters as for
-   query, and returns all its rows as a vector of maps: a CompletableFuture
-   on the JVM (deref it with @) and a js/Promise in ClojureScript. A failed
-   query fails it with the error."
+  "Runs sql on a client or a pool, sql being a string or a vector of a
+   statement and its parameters as for query, and returns all its rows as a
+   vector of maps: a CompletableFuture on the JVM (deref it with @) and a
+   js/Promise in ClojureScript. A failed query fails it with the error."
   [client sql]
   (let [settle (fn [ok fail]
                  (async/take! (async/into [] (query client sql))
@@ -233,7 +260,8 @@
       row to the reducing function as it arrives, so the rows are never all in
       memory. Works with reduce, transduce, into and run!; a reduced value, as
       from take, stops early. A failed query throws its error. It blocks the
-      reducing thread, so don't reduce it inside a go block.
+      reducing thread, so don't reduce it inside a go block. On a pool, the
+      reduce holds one connection until it returns.
 
       sql is a string or a vector of a statement and its parameters, as for
       query. The server sends rows in batches of :fetch-size (default 1000),
@@ -262,8 +290,3 @@
   (if (:ns &env)
     `(cljs.core.async/<! (cljs.core.async/into [] (query ~client ~sql)))
     `(clojure.core.async/<! (clojure.core.async/into [] (query ~client ~sql)))))
-
-(defn close [{:keys [message-socket requests] :as this}]
-  (async/close! requests)
-  (ms/close-message-socket message-socket)
-  (assoc this :message-socket nil :requests nil))

@@ -10,8 +10,12 @@
            :build {:deps {io.github.clojure/tools.build {:git/tag "v0.10.14" :git/sha "1176afd"}
                           slipset/deps-deploy {:mvn/version "0.2.5"}}
                    :ns-default build}
-           ;; clojure -M:cljs compile node | test
-           :cljs  {:extra-paths ["test"]
+           ;; clojure -M:stress [seconds] [workers]: pool stress test, not in the suite
+           :stress {:extra-paths ["stress"]
+                    :jvm-opts ["-Xmx1g"]
+                    :main-opts ["-m" "clunk.stress"]}
+           ;; clojure -M:cljs compile node | test | stress
+           :cljs  {:extra-paths ["test" "stress"]
                    :extra-deps {thheller/shadow-cljs {:mvn/version "3.5.11"}}
                    :main-opts ["-m" "shadow.cljs.devtools.cli"]}
            :test  {:extra-paths ["test"]
