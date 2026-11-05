@@ -1,7 +1,6 @@
 (ns clunk.byte-buffer-socket
   (:require
    [cljs.core.async :as async]
-   [clunk.framing :as framing]
    ["net" :as net]))
 
 (defn connected? [^js client]
@@ -15,10 +14,8 @@
   [^js d]
   (.slice (.-buffer d) (.-byteOffset d) (+ (.-byteOffset d) (.-length d))))
 
-(defn- init-buffer-socket [^js client]
-  (let [in-ch      (async/chan 64 (framing/frames)) ;; Whole messages out, whatever was read in
-        out-ch     (async/chan)
-        buff-sock  (map->ByteBufferSocket {:client  client
+(defn- init-buffer-socket [^js client in-ch out-ch]
+  (let [buff-sock  (map->ByteBufferSocket {:client  client
                                            :in      in-ch
                                            :out     out-ch})]
 
@@ -37,11 +34,11 @@
     buff-sock))
 
 (defn get-buffer-socket
-  ([port]
-   (get-buffer-socket (int port) "localhost"))
-  ([^Integer port ^String address]
-   (let [client (.createConnection net port address)]
-     (init-buffer-socket client))))
+  "Puts each chunk read as an ArrayBuffer on in-ch, and writes each view taken
+   from out-ch. Transducers on those channels do the rest."
+  [^Integer port ^String address in-ch out-ch]
+  (let [client (.createConnection net port address)]
+    (init-buffer-socket client in-ch out-ch)))
 
 (defn close-buffer-socket [{:keys [in out client]
                             :as   this}]
@@ -54,7 +51,7 @@
 ;; Example usage:
 (comment
   ;; Connect socket to postgres
-  (def buffer-socket (get-buffer-socket 5432))
+  (def buffer-socket (get-buffer-socket 5432 "localhost" (async/chan) (async/chan)))
   ;; startup message for user: "jimmy" and database: "world"
   (def startup-bytes (to-array [0 0 0 35 0 3 0 0 117 115 101 114 0 106 105 109 109 121 0 100 97 116 97 98 97 115 101 0 119 111 114 108 100 0 0]))
 

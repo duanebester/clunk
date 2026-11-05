@@ -1,8 +1,7 @@
 (ns clunk.byte-buffer-socket
   (:require
    [clojure.core.async :as async]
-   [clojure.tools.logging :as log]
-   [clunk.framing :as framing])
+   [clojure.tools.logging :as log])
   (:import
    (java.nio ByteBuffer)
    (java.nio.channels SocketChannel)
@@ -14,10 +13,8 @@
 (defn connected? [^SocketChannel client]
   (and (.isConnected client) (.isOpen client)))
 
-(defn- init-buffer-socket [^SocketChannel client]
-  (let [in-ch     (async/chan 64 (framing/frames)) ;; Whole messages out, whatever was read in
-        out-ch    (async/chan)
-        buff-sock (map->ByteBufferSocket {:client client
+(defn- init-buffer-socket [^SocketChannel client in-ch out-ch]
+  (let [buff-sock (map->ByteBufferSocket {:client client
                                           :in     in-ch
                                           :out    out-ch})]
     ;; Reads block, so they run on a real thread rather than a go block.
@@ -28,7 +25,7 @@
                        (catch java.io.IOException _ -1))] ;; Socket closed under us
             (if (neg? n)
               (async/close! in-ch)
-              (let [chunk (Arrays/copyOf (.array bb) n)]
+              (let [chunk (Arrays/copyOf (.array bb) (int n))]
                 (.clear bb)
                 (when (async/>!! in-ch chunk) ;; Blocks while readers are behind
                   (recur))))))))
@@ -45,11 +42,13 @@
     buff-sock))
 
 (defn get-buffer-socket
-  [^Integer port ^String address]
+  "Puts each chunk read as a byte array on in-ch, and writes each ByteBuffer
+   taken from out-ch. Transducers on those channels do the rest."
+  [^Integer port ^String address in-ch out-ch]
   (let [client (SocketChannel/open)
         address (InetSocketAddress. address port)]
     (.connect client address)
-    (init-buffer-socket client)))
+    (init-buffer-socket client in-ch out-ch)))
 
 (defn close-buffer-socket
   "Idempotent: both the caller and the message socket's read loop close it."
@@ -68,7 +67,7 @@
     [ba]
     (println (map #(int %) ba)))
 
-  (def buffer-socket (get-buffer-socket 5432 "localhost"))
+  (def buffer-socket (get-buffer-socket 5432 "localhost" (async/chan) (async/chan)))
 
   ;; Startup message for user: "jimmy", and database: "world"
   (def startup-bytes

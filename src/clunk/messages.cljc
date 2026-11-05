@@ -1,6 +1,5 @@
 (ns clunk.messages
-  (:require [clojure.core.match :as m]
-            [clunk.vendor.binf :as binf]
+  (:require [clunk.vendor.binf :as binf]
             [clunk.vendor.binf.buffer :as binf.buffer]
             [clunk.codecs :as codecs]))
 
@@ -56,23 +55,18 @@
 
 (defn handle-authentication [bs]
   (let [auth-req (codecs/rr-auth-req bs)]
-    (m/match auth-req
-      {:tag 0}
-      {:type :AuthenticationOk}
-      {:tag 5}
-      {:type :AuthenticationMD5
-       :salt (codecs/rr-auth-salt bs)}
-      {:tag 10}
-      {:type       :AuthenticationSASL
-       :mechanisms (loop [ms []]
-                     (let [m (codecs/rr-cstring bs)]
-                       (if (empty? m) ms (recur (conj ms m)))))}
-      {:tag 11}
-      {:type :AuthenticationSASLContinue
-       :data (binf/rr-string bs (binf/remaining bs))}
-      {:tag 12}
-      {:type :AuthenticationSASLFinal
-       :data (binf/rr-string bs (binf/remaining bs))})))
+    (case (int (:tag auth-req))
+      0  {:type :AuthenticationOk}
+      5  {:type :AuthenticationMD5
+          :salt (codecs/rr-auth-salt bs)}
+      10 {:type       :AuthenticationSASL
+          :mechanisms (loop [ms []]
+                        (let [m (codecs/rr-cstring bs)]
+                          (if (empty? m) ms (recur (conj ms m)))))}
+      11 {:type :AuthenticationSASLContinue
+          :data (binf/rr-string bs (binf/remaining bs))}
+      12 {:type :AuthenticationSASLFinal
+          :data (binf/rr-string bs (binf/remaining bs))})))
 
 (defn handle-error
   "Each field is a type byte and a string; S is severity, C the SQLSTATE code,

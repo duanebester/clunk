@@ -2,9 +2,9 @@
   "Turns the raw byte chunks a socket reads into whole backend messages.
 
    TCP delivers a stream, not messages: one read can hold several messages, the
-   end of one, or only part of a header. Both byte-buffer sockets put whatever
-   they read on a channel built with `frames`, so the code above them always
-   sees exactly one complete message per value."
+   end of one, or only part of a header. The message socket composes `frames`
+   into the transducer of the channel the byte-buffer socket reads into, so
+   the code above always sees exactly one complete message per value."
   (:require [clunk.vendor.binf :as binf]
             [clunk.vendor.binf.buffer :as buffer]))
 

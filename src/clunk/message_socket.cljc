@@ -1,9 +1,9 @@
 (ns clunk.message-socket
-  (:require [clojure.core.match :as m]
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
             [clunk.pw :as pw]
             [clunk.messages :as messages]
             [clunk.codecs :as codecs]
+            [clunk.framing :as framing]
             [clunk.byte-buffer-socket :as bs]))
 
 #?(:cljs (enable-console-print!))
@@ -16,66 +16,44 @@
 
 (defn handle-backend [bs]
   (let [header (codecs/rr-header bs)]
-    (m/match header
-      {:tag 90}
-      (messages/handle-ready-for-query bs)
-      {:tag 84}
-      (messages/handle-row-description bs)
-      {:tag 83}
-      (messages/handle-parameter-status bs)
-      {:tag 82}
-      (messages/handle-authentication bs)
-      {:tag 75}
-      (messages/handle-backend-key-data bs)
-      {:tag 69}
-      (messages/handle-error bs)
-      {:tag 68}
-      (messages/handle-data-row bs)
-      {:tag 67}
-      (messages/handle-close bs)
-      :else
+    (case (int (:tag header))
+      90 (messages/handle-ready-for-query bs)
+      84 (messages/handle-row-description bs)
+      83 (messages/handle-parameter-status bs)
+      82 (messages/handle-authentication bs)
+      75 (messages/handle-backend-key-data bs)
+      69 (messages/handle-error bs)
+      68 (messages/handle-data-row bs)
+      67 (messages/handle-close bs)
       (messages/handle-unknown bs header))))
 
 (defn handle-frontend [message]
-  (m/match message
-    {:type :StartupMessage}
-    (messages/build-startup (:user message) (:database message))
-    {:type :Query}
-    (messages/build-query (:query message))
-    {:type :PasswordMessage}
-    (messages/build-password (:password message))
-    {:type :SASLInitialResponse}
-    (messages/build-sasl-initial-response (:mechanism message) (:data message))
-    {:type :SASLResponse}
-    (messages/build-sasl-response (:data message))))
+  (case (:type message)
+    :StartupMessage      (messages/build-startup (:user message) (:database message))
+    :Query               (messages/build-query (:query message))
+    :PasswordMessage     (messages/build-password (:password message))
+    :SASLInitialResponse (messages/build-sasl-initial-response (:mechanism message) (:data message))
+    :SASLResponse        (messages/build-sasl-response (:data message))))
+
+(defn- decode
+  "handle-backend, except that a message that fails to decode becomes an error
+   message instead of an exception, so the bytes after it still frame."
+  [view]
+  (try (handle-backend view)
+       (catch #?(:clj Exception :cljs :default) e
+         {:type :ErrorMessage :message (str "Could not decode message: " (ex-message e))})))
 
 (defn get-message-socket
+  "Every translation happens in the channels' transducers, as bytes are put on
+   :in by the socket and as messages are put on :out by the caller, so nothing
+   sits between the socket and its reader."
   ([port] (get-message-socket port "localhost"))
   ([port host]
-   (let [buffer-socket (bs/get-buffer-socket port host)
-         in-ch         (async/chan)
-         out-ch        (async/chan)
-         message-sock  (map->MessageSocket {:buffer-socket buffer-socket
-                                            :in            in-ch
-                                            :out           out-ch})]
-
-     (async/go-loop []
-       (when (bs/connected? (:client buffer-socket))
-         (let [bbs (async/<! (:in buffer-socket))]
-           (if-not bbs
-             (bs/close-buffer-socket buffer-socket)
-             (when (async/>! in-ch (handle-backend bbs))
-               (recur))))))
-
-     (async/go-loop []
-       (when (bs/connected? (:client buffer-socket))
-         (let [message (async/<! out-ch)]
-           (if-not message
-             (bs/close-buffer-socket buffer-socket)
-             (when (async/>! (:out buffer-socket) (handle-frontend message))
-               (recur))))))
-
-     message-sock)))
+   (let [in  (async/chan 64 (comp (framing/frames) (map decode)))
+         out (async/chan 64 (map handle-frontend))]
+     (map->MessageSocket {:buffer-socket (bs/get-buffer-socket port host in out)
+                          :in            in
+                          :out           out}))))
 
 (defn close-message-socket [{:keys [in out buffer-socket]
                              :as   this}]
@@ -96,16 +74,14 @@
   (async/go-loop []
     (when-let [message (async/<! (:in message-socket))]
       (println message)
-      (m/match message
-        {:type :AuthenticationOk}
-        ()
-        {:type :AuthenticationMD5}
-          ;; Respond with password
+      (case (:type message)
+        :AuthenticationMD5
+        ;; Respond with password
         (let [salt     (:salt message)
               password (pw/calculate-pw username password salt)]
           (async/>! (:out message-socket) {:type     :PasswordMessage
                                            :password password}))
-        :else ())
+        nil)
       (recur)))
 
   (async/go
