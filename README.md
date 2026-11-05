@@ -63,7 +63,8 @@ clojure -M:cljs release node   # writes target/node/clunk.js
 ```
 
 ```js
-const clunk = require('./target/node/clunk.js');
+// example.mjs: an ES module, so it can await at the top level
+import clunk from './target/node/clunk.js';
 
 const client = await clunk.connect({ username: 'jimmy', password: 'banana', database: 'world' });
 const rows = await clunk.query(client, 'SELECT name FROM country ORDER BY name LIMIT 2');
