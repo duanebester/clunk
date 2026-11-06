@@ -5,6 +5,7 @@
             [clojure.core.async :as async]
             [clunk.core :as clunk]
             [clunk.messages :as messages]
+            [clunk.oid-types :as oid-types]
             [clunk.vendor.binf :as binf])
   #?(:clj (:import (clojure.lang ExceptionInfo)
                    (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZoneOffset)
@@ -62,6 +63,42 @@
                     (clunk/<query! c "SELECT 9007199254740993::int8 AS l, 0.1::float8 AS g, 'text'::text AS t")))
            (clunk/close c)))))
 
+(def ^:private decoder oid-types/decoder)
+
+(defn- set-decoder!
+  "Replaces oid-types/decoder, which each query looks its decoders up in."
+  [f]
+  #?(:clj (alter-var-root #'oid-types/decoder (constantly f))
+     :cljs (set! oid-types/decoder f)))
+
+(t/deftest a-value-that-fails-to-decode-fails-only-its-query
+  (let [c   (clunk/client config)
+        sql "SELECT g::int4 AS n, CASE WHEN g = 50 THEN point(1, 2) END AS p FROM generate_series(1, 100) g"]
+    (run (async/go
+           (async/<! (clunk/connect c))
+           ;; point is read as raw bytes; make it throw, as a parser does on a
+           ;; value it doesn't expect (NaN for a JVM numeric, say). NULL isn't decoded.
+           (set-decoder! (fn [oid]
+                           (if (= 600 oid)
+                             (fn [_ _] (throw #?(:clj (IllegalArgumentException. "bad point") :cljs (js/Error. "bad point"))))
+                             (decoder oid))))
+           ;; The rows before it arrive, then its error, and nothing after it.
+           (let [rows (clunk/<query! c sql)]
+             (t/is (= (for [n (range 1 50)] {:n n :p nil}) (butlast rows)))
+             (t/is (= "Could not decode column p (type 600): bad point" (ex-message (last rows))))
+             (t/is (= {:column "p" :oid 600 :sql sql} (ex-data (last rows)))))
+           (t/is (= [{:n 7}] (clunk/<query! c "SELECT 7::int4 AS n")))
+           ;; In a portal the server stops after the batch that held it, of 100
+           ;; rows: nextval counts the rows it produced.
+           (clunk/<query! c "CREATE TEMP SEQUENCE decode_rows")
+           (let [rows (async/<! (async/into [] (clunk/query c "SELECT nextval('decode_rows')::int4 AS n, CASE WHEN g = 50 THEN point(1, 2) END AS p FROM generate_series(1, 100000) g"
+                                                            {:cancel (async/promise-chan) :fetch-size 100})))]
+             (t/is (= 49 (count (butlast rows))))
+             (t/is (= 600 (:oid (ex-data (last rows))))))
+           (t/is (= [{:n 100}] (clunk/<query! c "SELECT last_value::int4 AS n FROM decode_rows")))
+           (set-decoder! decoder)
+           (clunk/close c)))))
+
 #?(:clj
    (t/deftest execute-returns-a-future-and-plan-a-reducible
      (let [c (clunk/client config)]
@@ -85,6 +122,16 @@
                             (clunk/plan c ["SELECT nextval('plan_rows')::int4 AS n FROM generate_series(1, $1)" 100000]
                                         {:fetch-size 100}))))
        (t/is (= [{:n 100}] @(clunk/execute c "SELECT last_value::int4 AS n FROM plan_rows")))
+       ;; NaN and Infinity are numerics with no BigDecimal, so they fail to
+       ;; decode, and fail only their own query.
+       (let [err (try (deref (clunk/execute c "SELECT 1::int4 AS n, 'NaN'::numeric AS x") 5000 :timed-out)
+                      (catch ExecutionException e (ex-cause e)))]
+         (t/is (= {:column "x" :oid 1700 :sql "SELECT 1::int4 AS n, 'NaN'::numeric AS x"} (ex-data err))))
+       (let [err (deref (future (try (into [] (clunk/plan c "SELECT 'Infinity'::numeric AS x"))
+                                     (catch ExceptionInfo e e)))
+                        5000 :timed-out)]
+         (t/is (= 1700 (:oid (ex-data err)))))
+       (t/is (= [{:n 7}] (deref (clunk/execute c "SELECT 7::int4 AS n") 5000 :timed-out)))
        (clunk/close c))))
 
 (t/deftest a-cancelled-query-closes-early-and-the-next-one-runs

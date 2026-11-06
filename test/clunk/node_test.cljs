@@ -4,6 +4,7 @@
             [cljs.core.async :as async]
             [cljs.core.async.interop :refer-macros [<p!]]
             [clunk.node :as node]
+            [clunk.oid-types :as oid-types]
             ["stream" :refer [Readable]]))
 
 (def config #js {:username "jimmy" :password "banana" :database "world"})
@@ -17,6 +18,9 @@
 
 (defn- pg-fields [^js err]
   [(.-code err) (.-severity err) (.-sql err)])
+
+(defn- decode-fields [^js err]
+  [(.-message err) (.-column err) (.-oid err) (.-sql err)])
 
 (t/deftest query-stream-and-errors
   (t/async done
@@ -48,6 +52,33 @@
       (let [err (async/<! (rejection (node/connect (doto (js/Object.assign #js {} config) (aset "password" "wrong")))))]
         (t/is (instance? js/Error err))
         (t/is (= "28P01" (.-code err))))
+      (done))))
+
+(t/deftest a-value-that-fails-to-decode-rejects-only-its-query
+  (t/async done
+    (async/go
+      ;; No Node decoder throws on a real value, so make point, read as raw
+      ;; bytes, throw as a parser does on a value it doesn't expect.
+      (let [decoder oid-types/decoder
+            p       (node/pool (js/Object.assign #js {:maxSize 1} config))
+            pid     #(async/go (get (first (js->clj (<p! (node/query p "SELECT pg_backend_pid() AS pid")))) "pid"))
+            before  (async/<! (pid))
+            sql     "SELECT 1::int4 AS n, point(1, 2) AS p"]
+        (set! oid-types/decoder #(if (= 600 %) (fn [_ _] (throw (js/Error. "bad point"))) (decoder %)))
+        (let [err (async/<! (rejection (node/query p sql)))]
+          (t/is (instance? js/Error err))
+          (t/is (not (instance? ExceptionInfo err)))
+          (t/is (= ["Could not decode column p (type 600): bad point" "p" 600 sql] (decode-fields err))))
+        (let [sql "SELECT g AS n, CASE WHEN g = 3 THEN point(1, 2) END AS p FROM generate_series(1, 10) g"
+              it  (node/stream p sql)]
+          (t/is (= [{"n" 1 "p" nil} {"n" 2 "p" nil}]
+                   [(js->clj (.-value (<p! (.next it)))) (js->clj (.-value (<p! (.next it))))]))
+          (t/is (= ["Could not decode column p (type 600): bad point" "p" 600 sql]
+                   (decode-fields (async/<! (rejection (.next it)))))))
+        ;; The pool's only connection is still in use.
+        (t/is (= before (async/<! (pid))))
+        (set! oid-types/decoder decoder)
+        (node/close p))
       (done))))
 
 (t/deftest a-pool-takes-the-place-of-a-client

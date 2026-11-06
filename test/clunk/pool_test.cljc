@@ -3,7 +3,8 @@
   (:require #?(:clj [clojure.test :as t] :cljs [cljs.test :as t])
             [clojure.core.async :as async]
             [clunk.core :as clunk]
-            [clunk.pool :as pool]))
+            [clunk.pool :as pool])
+  #?(:clj (:import (java.util.concurrent ExecutionException))))
 
 (def config {:username "jimmy" :password "banana" :database "world"})
 
@@ -136,4 +137,11 @@
                                nil
                                (clunk/plan p "SELECT generate_series(1, 1000)::int4 AS n"))))
        (t/is (= [{:n 7}] (deref (clunk/execute p "SELECT 7::int4 AS n") 5000 :timed-out)))
+       ;; A value that fails to decode (NaN has no BigDecimal) fails its query
+       ;; but leaves the protocol intact, so the connection stays in use.
+       (let [before (:pid (first @(clunk/execute p "SELECT pg_backend_pid() AS pid")))
+             err    (try (deref (clunk/execute p "SELECT 'NaN'::numeric AS x") 5000 :timed-out)
+                         (catch ExecutionException e (ex-cause e)))]
+         (t/is (= 1700 (:oid (ex-data err))))
+         (t/is (= [{:pid before}] (deref (clunk/execute p "SELECT pg_backend_pid() AS pid") 5000 :timed-out))))
        (clunk/close p))))

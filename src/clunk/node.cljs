@@ -6,10 +6,11 @@
 
 (defn- js-error
   "A plain JS Error for a clunk error, with the Postgres fields (code,
-   severity) and the sql as properties, as node-postgres has them."
+   severity) and the sql as properties, as node-postgres has them, and the
+   column and oid of a value that failed to decode."
   [e]
   (let [err (js/Error. (ex-message e))]
-    (doseq [[k v] (select-keys (ex-data e) [:code :severity :sql])]
+    (doseq [[k v] (select-keys (ex-data e) [:code :severity :sql :column :oid])]
       (aset err (name k) v))
     err))
 

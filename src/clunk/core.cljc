@@ -61,68 +61,87 @@
         in  (:in message-socket)
         out (:out message-socket)]
     (async/go
-      (async/>! out {:type :StartupMessage :user user :database (:database config)})
-      ;; scram holds the in-flight SCRAM-SHA-256 exchange between auth messages.
-      (loop [scram nil]
-        (let [message (async/<! in)]
-          (when debug
-            (println message))
-          (case (:type message)
-            nil
-            (error "Connection closed during startup" {})
+      (try
+        (async/>! out {:type :StartupMessage :user user :database (:database config)})
+        ;; scram holds the in-flight SCRAM-SHA-256 exchange between auth messages.
+        (loop [scram nil]
+          (let [message (async/<! in)]
+            (when debug
+              (println message))
+            (case (:type message)
+              nil
+              (error "Connection closed during startup" {})
 
-            :ReadyForQuery
-            message
+              :ReadyForQuery
+              message
 
-            :ErrorMessage
-            (error (str "Startup failed: " (:message message)) message)
+              :ErrorMessage
+              (error (str "Startup failed: " (:message message)) message)
 
-            :AuthenticationMD5
-            (do (async/>! out {:type     :PasswordMessage
-                               :password (pw/calculate-pw user password (:salt message))})
-                (recur scram))
+              :AuthenticationMD5
+              (do (async/>! out {:type     :PasswordMessage
+                                 :password (pw/calculate-pw user password (:salt message))})
+                  (recur scram))
 
-            :AuthenticationSASL
-            (if (some #{"SCRAM-SHA-256"} (:mechanisms message))
-              (let [first-msg (pw/scram-client-first)]
-                (async/>! out {:type      :SASLInitialResponse
-                               :mechanism "SCRAM-SHA-256"
-                               :data      (:message first-msg)})
-                (recur first-msg))
-              (error "Unsupported SASL mechanisms" message))
+              :AuthenticationSASL
+              (if (some #{"SCRAM-SHA-256"} (:mechanisms message))
+                (let [first-msg (pw/scram-client-first)]
+                  (async/>! out {:type      :SASLInitialResponse
+                                 :mechanism "SCRAM-SHA-256"
+                                 :data      (:message first-msg)})
+                  (recur first-msg))
+                (error "Unsupported SASL mechanisms" message))
 
-            :AuthenticationSASLContinue
-            (let [final-msg (pw/scram-client-final (assoc scram
-                                                          :password password
-                                                          :server-first (:data message)))]
-              (async/>! out {:type :SASLResponse :data (:message final-msg)})
-              (recur final-msg))
+              :AuthenticationSASLContinue
+              (let [final-msg (pw/scram-client-final (assoc scram
+                                                            :password password
+                                                            :server-first (:data message)))]
+                (async/>! out {:type :SASLResponse :data (:message final-msg)})
+                (recur final-msg))
 
-            :AuthenticationSASLFinal
-            (if (pw/scram-server-final-valid? scram (:data message))
-              (recur nil)
-              (error "SCRAM server signature mismatch" message))
+              :AuthenticationSASLFinal
+              (if (pw/scram-server-final-valid? scram (:data message))
+                (recur nil)
+                (error "SCRAM server signature mismatch" message))
 
-            (recur scram)))))))
+              (recur scram))))
+        ;; The exchange throws on an answer it can't use, such as a SCRAM nonce
+        ;; that doesn't extend ours; connect must still get an error.
+        (catch #?(:clj Exception :cljs :default) e
+          (ex-info (str "Startup failed: " (ex-message e)) {} e))))))
+
+(defn- decode-value
+  "Reads one value of field's column with decode, or throws an error naming
+   the column, its type OID and sql."
+  [decode view len field sql]
+  (try (decode view len)
+       (catch #?(:clj Exception :cljs :default) e
+         (throw (ex-info (str "Could not decode column " (:field-name field) " (type " (:oid field) "): " (ex-message e))
+                         {:column (:field-name field) :oid (:oid field) :sql sql}
+                         e)))))
 
 (defn- row-decoder
   "From a RowDescription's fields, a function that reads a DataRow's view
-   straight into a row map. Keys and per-column decoders are built once here,
-   not once per row."
-  [fields]
-  (let [ks       (object-array (map (comp keyword :field-name) fields))
+   straight into a row map, or into an error if a value fails to decode. Keys
+   and per-column decoders are built once here, not once per row."
+  [fields sql]
+  (let [fs       (object-array fields)
+        ks       (object-array (map (comp keyword :field-name) fields))
         decoders (object-array (map (comp oid-types/decoder :oid) fields))
         n        (count fields)]
     (fn [view]
       (binf/rr-i16 view) ;; column count, same as the RowDescription's
-      (loop [i 0
-             row (transient {})]
-        (if (< i n)
-          (let [len (binf/rr-i32 view)] ;; -1 is SQL NULL
-            (recur (inc i)
-                   (assoc! row (aget ks i)
-                           (when (<= 0 len) ((aget decoders i) view len)))))
-          (persistent! row))))))
+      (try
+        (loop [i 0
+               row (transient {})]
+          (if (< i n)
+            (let [len (binf/rr-i32 view)] ;; -1 is SQL NULL
+              (recur (inc i)
+                     (assoc! row (aget ks i)
+                             (when (<= 0 len) (decode-value (aget decoders i) view len (aget fs i) sql)))))
+            (persistent! row)))
+        (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
+          e)))))
 
 (def ^:private batch-size
   "Most rows serve puts on a query's out at once. out takes a batch only once
@@ -135,12 +154,16 @@
 (defn- poll-rows
   "Decodes message, a DataRow, and the DataRows already waiting on in after
    it, up to batch-size rows. Returns the rows and the next message polled,
-   or nil if none was."
+   or nil if none was. A row that fails to decode ends the rows with its
+   error, and nothing after it is polled."
   [in decode-row message]
-  (loop [rows (transient [(decode-row (:view message))])]
-    (let [m (when (< (count rows) batch-size) (async/poll! in))]
+  (loop [rows (transient [])
+         m    message]
+    (let [row  (decode-row (:view m))
+          rows (conj! rows row)
+          m    (when (and (< (count rows) batch-size) (not (error? row))) (async/poll! in))]
       (if (= :DataRow (:type m))
-        (recur (conj! rows (decode-row (:view m))))
+        (recur rows m)
         [(persistent! rows) m]))))
 
 (def ^:private default-fetch-size
@@ -172,7 +195,8 @@
                             ;; Sync would end the implicit transaction, and the portal with it.
                             {:type (if batched? :Flush :Sync)}]
                            {:type :Query :query sql}))
-          ;; live? turns false at the first put that out refuses because it's closed.
+          ;; live? turns false at the first put that out refuses because it's closed,
+          ;; or once a row fails to decode, which fails the query like a server error.
           ;; synced? turns true once Sync is sent; the server then ends with ReadyForQuery.
           ;; polled is a message poll-rows already took from in, or nil.
           (loop [decode-row nil
@@ -185,13 +209,13 @@
                                      (async/>! out [(error "Connection closed during query" {:sql sql})]))
                                    (async/close! out))
                 :ReadyForQuery (async/close! out)
-                :RowDescription (recur (row-decoder (:values message)) live? synced? nil)
+                :RowDescription (recur (row-decoder (:values message) sql) live? synced? nil)
                 ;; Rows already read go to out together, up to batch-size, so a
                 ;; reader parked on out is woken once per batch rather than once
                 ;; per row. On the JVM each wake hands it to another thread.
                 :DataRow       (if live?
                                  (let [[rows next] (poll-rows in decode-row message)]
-                                   (recur decode-row (async/>! out rows) synced? next))
+                                   (recur decode-row (and (async/>! out rows) (not (error? (peek rows)))) synced? next))
                                  (recur decode-row false synced? nil))
                 :PortalSuspended (do (async/>! send (if live?
                                                       [{:type :Execute :max-rows fetch-size} {:type :Flush}]
