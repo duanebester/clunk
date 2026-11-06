@@ -1,19 +1,21 @@
 (ns clunk.byte-buffer-socket
   (:require
    [clojure.core.async :as async]
-   [clojure.tools.logging :as log])
+   [clojure.tools.logging :as log]
+   [clunk.tls :as tls])
   (:import
    (java.nio ByteBuffer)
-   (java.nio.channels SocketChannel)
-   (java.net InetSocketAddress)
+   (java.nio.channels ByteChannel)
    (java.util Arrays)))
 
-(defrecord ByteBufferSocket [^SocketChannel client in-ch out-ch])
+;; client is a connected SocketChannel, or a TLS connection behind the same
+;; ByteChannel interface (see clunk.tls).
+(defrecord ByteBufferSocket [^ByteChannel client in-ch out-ch])
 
-(defn connected? [^SocketChannel client]
-  (and (.isConnected client) (.isOpen client)))
+(defn connected? [^ByteChannel client]
+  (.isOpen client))
 
-(defn- init-buffer-socket [^SocketChannel client in-ch out-ch]
+(defn- init-buffer-socket [^ByteChannel client in-ch out-ch]
   (let [buff-sock (map->ByteBufferSocket {:client client
                                           :in     in-ch
                                           :out    out-ch})]
@@ -49,16 +51,15 @@
 
 (defn get-buffer-socket
   "Puts each chunk read as a byte array on in-ch, and writes each ByteBuffer
-   taken from out-ch. Transducers on those channels do the rest."
-  [^Integer port ^String address in-ch out-ch]
-  (let [client (SocketChannel/open)
-        address (InetSocketAddress. address port)]
-    (.connect client address)
-    (init-buffer-socket client in-ch out-ch)))
+   taken from out-ch. Transducers on those channels do the rest. ssl is nil,
+   or the TLS settings clunk.tls/connect takes."
+  ([port address in-ch out-ch] (get-buffer-socket port address in-ch out-ch nil))
+  ([^Integer port ^String address in-ch out-ch ssl]
+   (init-buffer-socket (tls/connect port address ssl) in-ch out-ch)))
 
 (defn close-buffer-socket
   "Idempotent: both the caller and the message socket's read loop close it."
-  [{:keys [in out ^SocketChannel client]
+  [{:keys [in out ^ByteChannel client]
     :as   this}]
   (async/close! in)
   (async/close! out)

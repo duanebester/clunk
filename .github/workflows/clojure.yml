@@ -57,6 +57,15 @@ jobs:
             ~/.gitlibs
           key: deps-${{ hashFiles('deps.edn') }}
 
+      # The TLS tests need TLS on in Postgres, a test CA, and two TLS-only users.
+      - name: Turn on TLS in Postgres
+        run: test/tls/configure-postgres.sh
+        env:
+          PGHOST: localhost
+          PGUSER: jimmy
+          PGPASSWORD: banana
+          PGDATABASE: world
+
       - name: Test on the JVM
         run: clojure -X:test
 

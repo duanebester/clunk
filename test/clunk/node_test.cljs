@@ -5,6 +5,7 @@
             [cljs.core.async.interop :refer-macros [<p!]]
             [clunk.node :as node]
             [clunk.oid-types :as oid-types]
+            ["fs" :as fs]
             ["stream" :refer [Readable]]))
 
 (def config #js {:username "jimmy" :password "banana" :database "world"})
@@ -98,4 +99,20 @@
             (t/is (= [{"pid" before "n" 7}] (js->clj rows)))))
         (node/close p)
         (t/is (= "Pool is closed" (.-message (async/<! (rejection (node/query p "SELECT 1")))))))
+      (done))))
+
+(t/deftest tls-settings-take-js-names
+  (t/async done
+    (async/go
+      (let [tls #js {:username "clunk_ssl" :password "clunk_ssl" :database "world" :ssl "verify-full"}
+            c   (<p! (node/connect (js/Object.assign #js {:sslRootCert "test/tls/certs/ca.crt"} tls)))]
+        (t/is (= [{"ssl" true}] (js->clj (<p! (node/query c "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")))))
+        (node/close c)
+        ;; sslOptions go to tls.connect as they are: here, the CA as a Buffer.
+        (let [p (node/pool (js/Object.assign #js {:maxSize 1 :sslOptions #js {:ca (fs/readFileSync "test/tls/certs/ca.crt")}} tls))]
+          (t/is (= [{"n" 1}] (js->clj (<p! (node/query p "SELECT 1 AS n")))))
+          (node/close p))
+        (let [err (async/<! (rejection (node/connect (js/Object.assign #js {:hostname "127.0.0.1" :sslRootCert "test/tls/certs/ca.crt"} tls))))]
+          (t/is (instance? js/Error err))
+          (t/is (re-find #"TLS handshake failed.*127\.0\.0\.1" (.-message err)))))
       (done))))

@@ -1,7 +1,7 @@
 (ns clunk.byte-buffer-socket
   (:require
    [cljs.core.async :as async]
-   ["net" :as net]))
+   [clunk.tls :as tls]))
 
 (defn connected?
   "True until the socket is destroyed, as it is once the server hangs up.
@@ -9,6 +9,7 @@
   [^js client]
   (not (.-destroyed client)))
 
+;; client is a net.Socket, or with TLS a Duplex that acts like one (see clunk.tls).
 (defrecord ByteBufferSocket [client in-ch out-ch])
 
 (defn- chunk->buffer
@@ -41,10 +42,11 @@
 
 (defn get-buffer-socket
   "Puts each chunk read as an ArrayBuffer on in-ch, and writes each view taken
-   from out-ch. Transducers on those channels do the rest."
-  [^Integer port ^String address in-ch out-ch]
-  (let [client (.createConnection net port address)]
-    (init-buffer-socket client in-ch out-ch)))
+   from out-ch. Transducers on those channels do the rest. ssl is nil, or the
+   TLS settings clunk.tls/connect takes."
+  ([port address in-ch out-ch] (get-buffer-socket port address in-ch out-ch nil))
+  ([^Integer port ^String address in-ch out-ch ssl]
+   (init-buffer-socket (tls/connect port address ssl) in-ch out-ch)))
 
 (defn close-buffer-socket [{:keys [in out client]
                             :as   this}]

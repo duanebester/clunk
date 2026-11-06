@@ -34,6 +34,43 @@
     (ms/close-message-socket message-socket)
     (assoc this :message-socket nil :requests nil)))
 
+(defn- ssl-config
+  "The TLS settings in config, in the form clunk.tls takes them, or nil for a
+   plain connection. :ssl is a mode named as libpq's sslmode is:
+     :disable      plain (the default; also nil or false)
+     :prefer       TLS if the server offers it, else plain
+     :require      TLS, without checking the server's certificate
+     :verify-ca    TLS, with a certificate signed by a trusted CA
+     :verify-full  TLS, with a trusted certificate for the server's name (also true)
+   :prefer and :require check the certificate as :verify-ca does when
+   :ssl-root-cert is given, as libpq does when it has a root certificate.
+   :ssl-negotiation :direct starts TLS at once, without asking first, which
+   saves a round trip but needs Postgres 17 or later."
+  [config host]
+  (let [ssl         (get config :ssl :disable)
+        mode        (case ssl (nil false) :disable true :verify-full (keyword ssl))
+        negotiation (keyword (get config :ssl-negotiation :postgres))]
+    (when-not (#{:disable :prefer :require :verify-ca :verify-full} mode)
+      (throw (ex-info (str "Unknown :ssl mode " (pr-str ssl)) {:ssl ssl})))
+    (when-not (#{:postgres :direct} negotiation)
+      (throw (ex-info (str "Unknown :ssl-negotiation " (pr-str negotiation)) {:ssl-negotiation negotiation})))
+    (when (and (= :direct negotiation) (= :prefer mode))
+      (throw (ex-info ":ssl-negotiation :direct needs :ssl :require or stronger" {:ssl ssl})))
+    (when-not (= :disable mode)
+      {:mode        mode
+       :negotiation negotiation
+       ;; The name sent for SNI and checked by :verify-full.
+       :servername  (get config :ssl-servername host)
+       ;; Each a file path, PEM text, or on Node a Buffer.
+       :root-cert   (:ssl-root-cert config)
+       :cert        (:ssl-cert config)
+       :key         (:ssl-key config)
+       ;; Passed through: a javax.net.ssl.SSLContext, which replaces
+       ;; :ssl-root-cert, :ssl-cert and :ssl-key, or Node tls.connect options,
+       ;; which are merged over clunk's own.
+       :context     (:ssl-context config)
+       :options     (:ssl-options config)})))
+
 (defn client [config]
   (let [host     (get config :hostname "localhost")
         port     (get config :port 5432)
@@ -41,7 +78,7 @@
         password (get config :password "")
         database (get config :database "postgres")
         debug    (get config :debug false)
-        msocket  (ms/get-message-socket port host)
+        msocket  (ms/get-message-socket port host (ssl-config config host))
         cfg      {:debug debug :host host :port port :user user :password password :database database}]
     (map->Client {:message-socket msocket :config cfg :requests (async/chan 64)})))
 
@@ -70,7 +107,8 @@
               (println message))
             (case (:type message)
               nil
-              (error "Connection closed during startup" {})
+              (let [cause (ms/closed-by message-socket)]
+                (ex-info (str "Connection closed during startup" (some->> cause ex-message (str ": "))) {} cause))
 
               :ReadyForQuery
               message

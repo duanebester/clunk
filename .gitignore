@@ -16,3 +16,4 @@ scratch/
 
 target/
 .shadow-cljs/
+test/tls/certs/

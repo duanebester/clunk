@@ -14,6 +14,15 @@
   [^MessageSocket ms]
   (bs/connected? (:client (:buffer-socket ms))))
 
+(defn closed-by
+  "The error that closed the connection, if one did and the platform keeps
+   it: Node's socket does, as errored. The JVM fails while connecting instead."
+  [^MessageSocket ms]
+  #?(:clj  nil
+     :cljs (when-let [^js e (some-> ^js (:client (:buffer-socket ms)) .-errored)]
+             ;; Refused on both IPv6 and IPv4, it's an AggregateError with no message.
+             (if (and (empty? (.-message e)) (.-errors e)) (last (.-errors e)) e))))
+
 (defn handle-backend [bs]
   (let [header (codecs/rr-header bs)]
     (case (int (:tag header))
@@ -66,10 +75,11 @@
    :in by the socket and as messages are put on :out by the caller, so nothing
    sits between the socket and its reader."
   ([port] (get-message-socket port "localhost"))
-  ([port host]
+  ([port host] (get-message-socket port host nil))
+  ([port host ssl]
    (let [in  (async/chan 64 (comp (framing/frames) (map decode)))
          out (async/chan 64 (map handle-frontend))]
-     (map->MessageSocket {:buffer-socket (bs/get-buffer-socket port host in out)
+     (map->MessageSocket {:buffer-socket (bs/get-buffer-socket port host in out ssl)
                           :in            in
                           :out           out}))))
 

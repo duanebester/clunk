@@ -1,6 +1,7 @@
 (ns clunk.node
   "Promise API for JavaScript callers, exported by the shadow-cljs :node build."
   (:require [cljs.core.async :as async]
+            [clojure.set :as set]
             [clunk.core :as clunk]
             [clunk.pool :as pool]))
 
@@ -14,11 +15,29 @@
       (aset err (name k) v))
     err))
 
+(defn- clj-config
+  "A JS config object as clunk.core/client takes it. sslOptions, Node
+   tls.connect options, stay a JS object."
+  [^js config]
+  (-> (js->clj config :keywordize-keys true)
+      (dissoc :sslOptions)
+      (set/rename-keys {:maxSize        :max-size
+                        :sslRootCert    :ssl-root-cert
+                        :sslCert        :ssl-cert
+                        :sslKey         :ssl-key
+                        :sslServername  :ssl-servername
+                        :sslNegotiation :ssl-negotiation})
+      (cond-> (.-sslOptions config) (assoc :ssl-options (.-sslOptions config)))))
+
 (defn connect
   "connect({hostname, port, username, password, database}) resolves to a
-   client once the server is ready for queries."
+   client once the server is ready for queries. For TLS, add ssl: 'disable',
+   'prefer', 'require', 'verify-ca' or 'verify-full' (or true, for
+   'verify-full'), and as needed sslRootCert, sslCert and sslKey (each a file
+   name, PEM text or a Buffer), sslServername, sslNegotiation: 'direct', and
+   sslOptions for tls.connect."
   [config]
-  (let [c (clunk/client (js->clj config :keywordize-keys true))]
+  (let [c (clunk/client (clj-config config))]
     (js/Promise.
      (fn [resolve reject]
        (async/take! (clunk/connect c)
@@ -30,10 +49,10 @@
 (defn pool
   "pool({hostname, port, username, password, database, maxSize}) returns a
    pool of up to maxSize (default 10) clients that connect when queries need
-   them. query and stream take it in place of a client."
+   them. query and stream take it in place of a client. It takes connect's
+   TLS settings too."
   [config]
-  (let [{:keys [maxSize] :as cfg} (js->clj config :keywordize-keys true)]
-    (pool/pool (cond-> cfg maxSize (assoc :max-size maxSize)))))
+  (pool/pool (clj-config config)))
 
 (defn- sql-params
   "sql with the values in a params array, null or undefined for none."

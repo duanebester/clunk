@@ -134,4 +134,8 @@ timed fetch_deps
 step "Starting and seeding Postgres $PG_MAJOR"
 timed setup_postgres
 
+step "Turning on TLS in Postgres for the TLS tests"
+timed env PGHOST=localhost PGUSER="$PG_USER" PGPASSWORD="$PG_PASSWORD" PGDATABASE="$PG_DB" \
+  test/tls/configure-postgres.sh
+
 step "Setup complete"

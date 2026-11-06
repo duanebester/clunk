@@ -151,6 +151,14 @@
     (binf/wr-b8 view (byte 0x00))
     view))
 
+(defn build-ssl-request
+  "Asks the server, before the StartupMessage, whether it will talk TLS. It
+   answers with one byte, S or N, which isn't a message."
+  []
+  (-> (binf/view (binf.buffer/alloc 8))
+      (binf/wr-b32 (int 8))
+      (binf/wr-b32 (int 80877103)))) ;; 1234 << 16 | 5679
+
 ;; The extended query protocol. clunk uses only the unnamed statement and the
 ;; unnamed portal, both written as the empty string, and text format for
 ;; parameters and results.

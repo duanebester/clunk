@@ -28,6 +28,21 @@ Talking to Postgres via sockets. At this point in time, I'm just experimenting w
 (async/<!! (clunk/connect client))
 ```
 
+For TLS, as hosted Postgres (RDS, Supabase, Neon, Cloud SQL) needs, set `:ssl` to a mode named as libpq's `sslmode` is. `:verify-full` (or `true`) checks that the server's certificate is signed by a trusted CA and names the host; `:verify-ca` checks only the CA; `:require` encrypts without checking; `:prefer` encrypts if the server offers TLS and otherwise doesn't; `:disable`, the default, never asks. Without `:ssl-root-cert`, the CAs trusted are the JVM's, or on Node, Node's bundled ones; providers whose CA isn't among them, such as RDS and Supabase, publish one to download. A failed handshake, or a server that won't talk TLS when the mode needs it, fails the connection with the reason: `client` throws on the JVM, and `connect` yields the error on Node.
+
+```clj
+(clunk/client {:hostname "db.example.com" :username "jimmy" :password "banana" :database "world"
+               :ssl :verify-full
+               :ssl-root-cert "ca.pem"            ;; a file or PEM text; default: the platform's CAs
+               ;; :ssl-cert "client.pem" :ssl-key "client.key" ;; for cert auth; on the JVM the key must be PKCS#8
+               ;; :ssl-servername "db.example.com" ;; the name for SNI and the check, if not :hostname
+               ;; :ssl-negotiation :direct         ;; Postgres 17+: start TLS at once, saving a round trip
+               ;; :ssl-context ctx                 ;; JVM: your own javax.net.ssl.SSLContext
+               })
+```
+
+On Node, the same settings are `ssl: 'verify-full'`, `sslRootCert`, `sslCert`, `sslKey` (each also a `Buffer`), `sslServername` and `sslNegotiation`, and `sslOptions` passes options to `tls.connect`.
+
 `execute` returns a `CompletableFuture` of all the rows as a vector of maps, so `@` waits for them. A failed query fails the future; `@` then throws an `ExecutionException` whose cause is an `ex-info` with the Postgres `:code`, `:message`, and `:severity` in its `ex-data`. The next query still runs. Queries on one client run one at a time, in the order they were made; to run them in parallel, use a [pool](#a-pool).
 
 ```clj
@@ -234,10 +249,11 @@ serve({ fetch: app.fetch, port: 3000 });
 
 ### Running The Tests
 
-The tests need the Postgres from `docker-compose.yml`:
+The tests need the Postgres from `docker-compose.yml`, with TLS turned on by a script that makes a test CA and certificates in `test/tls/certs` and installs them (it needs `openssl` and `psql`):
 
 ```bash
 docker compose up -d
+PGHOST=localhost PGUSER=jimmy PGPASSWORD=banana PGDATABASE=world test/tls/configure-postgres.sh
 ```
 
 Run them on the JVM, then on Node:
@@ -261,6 +277,7 @@ A benchmark, also outside the suite, measures one client's read throughput on 1-
 ```bash
 clojure -M:bench 5   # seconds per case
 clojure -M:cljs compile bench && node target/bench/bench.js 5
+clojure -M:bench 5 verify-full          # over TLS; add direct for direct negotiation
 ```
 
 ### Releasing
