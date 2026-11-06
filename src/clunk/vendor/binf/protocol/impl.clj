@@ -258,13 +258,22 @@
       (.getDouble this))
 
     (rr-string [this decoder n-byte]
-      (let [string (.toString (.decode ^Charset decoder
-                                       (-> this
-                                           .duplicate
-                                           (.limit (int (+ (.position this)
-                                                             n-byte))))))]
-        (binf.protocol/skip this
-                            n-byte)
+      (let [n        (int n-byte)
+            position (.position this)
+            string   (if (.hasArray this)
+                       (String. (.array this)
+                                (+ (.arrayOffset this)
+                                   position)
+                                n
+                                ^Charset decoder)
+                       (.toString (.decode ^Charset decoder
+                                           (-> this
+                                               .duplicate
+                                               (.limit (+ position
+                                                          n))))))]
+        (.position this
+                   (+ position
+                      n))
         string))
 
 

@@ -256,6 +256,13 @@ clojure -M:stress 180 2000   # seconds, workers
 clojure -M:cljs compile stress && node --expose-gc target/stress/stress.js 180 2000
 ```
 
+A benchmark, also outside the suite, measures one client's read throughput on 1-row, 1,000-row and 100,000-row results, with one caller and with 100 sharing the client:
+
+```bash
+clojure -M:bench 5   # seconds per case
+clojure -M:cljs compile bench && node target/bench/bench.js 5
+```
+
 ### Releasing
 
 `build.clj` uses [tools.build](https://github.com/clojure/tools.build) and [deps-deploy](https://github.com/slipset/deps-deploy). The version is `0.0.<commit count>`.

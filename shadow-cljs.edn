@@ -13,6 +13,10 @@
           :stress {:target    :node-script
                    :main      clunk.stress/main
                    :output-to "target/stress/stress.js"}
+          ;; One client's read throughput, not in the suite; see stress/clunk/bench.cljc.
+          :bench  {:target    :node-script
+                   :main      clunk.bench/main
+                   :output-to "target/bench/bench.js"}
           :test {:target    :node-test
                  :output-to "target/test/node-tests.js"
                  :ns-regexp "-test$"}}}

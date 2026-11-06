@@ -99,7 +99,7 @@
   (submit [this {:keys [out cancel cancelled] :as request}]
     (checkout! this (fn [c]
                       (if (clunk/error? c)
-                        (async/put! out c (fn [_] (async/close! out)))
+                        (async/put! out [c] (fn [_] (async/close! out)))
                         ;; A go block, so a long run of cancelled waiters, each
                         ;; handing the client to the next, stays off the stack.
                         (async/go

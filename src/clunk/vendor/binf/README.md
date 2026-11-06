@@ -13,9 +13,13 @@ Only the namespaces clunk needs are included: `binf`, `buffer`, `int`,
   type-hints the views it chains on. Upstream calls those methods through
   reflection, which was two thirds of clunk's time decoding large results.
   `(set! *warn-on-reflection* true)` before requiring it should print nothing.
+- `rr-string` on a heap `ByteBuffer` builds the `String` straight from the
+  backing array, rather than through `Charset.decode` and a `CharBuffer`, and
+  keeps the position arithmetic unboxed. That made 100,000-row reads about 30%
+  faster.
 
 To update, copy those files from a newer upstream tag, repeat the rename, and
-reapply the reflection fixes:
+reapply the reflection and `rr-string` fixes:
 
 ```sh
 sed -i 's/helins\.binf/clunk.vendor.binf/g' $(find src/clunk/vendor -name '*.clj*')

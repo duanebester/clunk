@@ -12,7 +12,8 @@
    (clunk.pool)."
   (submit [this request]
     "Queues request, a map with :sql, :params, :fetch-size, :out (the row
-     channel), :cancel (the caller's cancel channel, or nil) and :cancelled
+     channel, which takes vectors of rows or errors and spreads them over its
+     buffer), :cancel (the caller's cancel channel, or nil) and :cancelled
      (an atom that turns true once query's watcher has seen cancel fire), to
      run on a connection.
      Closes :out at once if it can't. A request's optional :done function is
@@ -123,57 +124,88 @@
                            (when (<= 0 len) ((aget decoders i) view len)))))
           (persistent! row))))))
 
+(def ^:private batch-size
+  "Most rows serve puts on a query's out at once. out takes a batch only once
+   its reader has taken every row of the last one, so with one more batch
+   parked, at most 64 rows are read ahead of the reader, as when rows were put
+   one at a time on a buffer of 64. That keeps a query that stops early from
+   asking the server for another fetch-size batch."
+  32)
+
+(defn- poll-rows
+  "Decodes message, a DataRow, and the DataRows already waiting on in after
+   it, up to batch-size rows. Returns the rows and the next message polled,
+   or nil if none was."
+  [in decode-row message]
+  (loop [rows (transient [(decode-row (:view message))])]
+    (let [m (when (< (count rows) batch-size) (async/poll! in))]
+      (if (= :DataRow (:type m))
+        (recur (conj! rows (decode-row (:view m))))
+        [(persistent! rows) m]))))
+
 (def ^:private default-fetch-size
   "Rows per batch for a query that has a :cancel channel."
   1000)
 
-(defn- run-query
-  "Sends one query and streams its rows to out until the server is ready
-   again. Errors go to out as values; out is always closed. Once out is
-   closed, it reads and discards the rest of the result.
+(defn- serve
+  "Runs the client's queued queries one at a time, all in one go block: sends
+   each query and streams its rows to its out until the server is ready
+   again, then calls its :done. Errors go to out as values; out is always
+   closed. Once out is closed, it reads and discards the rest of the result.
 
    A query with params or a fetch size goes through the extended protocol.
    With a fetch size, each Execute asks for that many rows, and the next
    batch is asked for only while out is open, so closing out also stops the
    server. Otherwise sql goes as a simple Query, which can hold several
    statements."
-  [{:keys [message-socket]} {:keys [sql params fetch-size out]}]
-  (let [in       (:in message-socket)
-        send     (:out message-socket)
-        batched? (pos? fetch-size)]
-    (async/go
-      (async/>! send (if (or params batched?)
-                       [{:type :Parse :query sql}
-                        {:type :Bind :params params}
-                        {:type :Describe}
-                        {:type :Execute :max-rows fetch-size}
-                        ;; Sync would end the implicit transaction, and the portal with it.
-                        {:type (if batched? :Flush :Sync)}]
-                       {:type :Query :query sql}))
-      ;; live? turns false at the first put that out refuses because it's closed.
-      ;; synced? turns true once Sync is sent; the server then ends with ReadyForQuery.
-      (loop [decode-row nil
-             live?      true
-             synced?    (not batched?)]
-        (let [message (async/<! in)]
-          (case (:type message)
-            nil            (do (when live?
-                                 (async/>! out (error "Connection closed during query" {:sql sql})))
-                               (async/close! out))
-            :ReadyForQuery (async/close! out)
-            :RowDescription (recur (row-decoder (:values message)) live? synced?)
-            :DataRow       (recur decode-row (and live? (async/>! out (decode-row (:view message)))) synced?)
-            :PortalSuspended (do (async/>! send (if live?
-                                                  [{:type :Execute :max-rows fetch-size} {:type :Flush}]
-                                                  [{:type :Close} {:type :Sync}]))
-                                 (recur decode-row live? (not live?)))
-            (:CommandComplete :EmptyQueryResponse)
-            (do (when-not synced? (async/>! send {:type :Sync}))
-                (recur decode-row live? true))
-            ;; After an error the server skips to the next Sync.
-            :ErrorMessage  (do (when-not synced? (async/>! send {:type :Sync}))
-                               (recur decode-row (and live? (async/>! out (error (:message message) (assoc message :sql sql)))) true))
-            (recur decode-row live? synced?)))))))
+  [{:keys [message-socket requests]}]
+  (let [in   (:in message-socket)
+        send (:out message-socket)]
+    (async/go-loop []
+      (when-let [{:keys [sql params fetch-size out done]} (async/<! requests)]
+        (let [batched? (pos? fetch-size)]
+          (async/>! send (if (or params batched?)
+                           [{:type :Parse :query sql}
+                            {:type :Bind :params params}
+                            {:type :Describe}
+                            {:type :Execute :max-rows fetch-size}
+                            ;; Sync would end the implicit transaction, and the portal with it.
+                            {:type (if batched? :Flush :Sync)}]
+                           {:type :Query :query sql}))
+          ;; live? turns false at the first put that out refuses because it's closed.
+          ;; synced? turns true once Sync is sent; the server then ends with ReadyForQuery.
+          ;; polled is a message poll-rows already took from in, or nil.
+          (loop [decode-row nil
+                 live?      true
+                 synced?    (not batched?)
+                 polled     nil]
+            (let [message (or polled (async/<! in))]
+              (case (:type message)
+                nil            (do (when live?
+                                     (async/>! out [(error "Connection closed during query" {:sql sql})]))
+                                   (async/close! out))
+                :ReadyForQuery (async/close! out)
+                :RowDescription (recur (row-decoder (:values message)) live? synced? nil)
+                ;; Rows already read go to out together, up to batch-size, so a
+                ;; reader parked on out is woken once per batch rather than once
+                ;; per row. On the JVM each wake hands it to another thread.
+                :DataRow       (if live?
+                                 (let [[rows next] (poll-rows in decode-row message)]
+                                   (recur decode-row (async/>! out rows) synced? next))
+                                 (recur decode-row false synced? nil))
+                :PortalSuspended (do (async/>! send (if live?
+                                                      [{:type :Execute :max-rows fetch-size} {:type :Flush}]
+                                                      [{:type :Close} {:type :Sync}]))
+                                     (recur decode-row live? (not live?) nil))
+                (:CommandComplete :EmptyQueryResponse)
+                (do (when-not synced? (async/>! send {:type :Sync}))
+                    (recur decode-row live? true nil))
+                ;; After an error the server skips to the next Sync.
+                :ErrorMessage  (do (when-not synced? (async/>! send {:type :Sync}))
+                                   (recur decode-row (and live? (async/>! out [(error (:message message) (assoc message :sql sql))])) true nil))
+                (recur decode-row live? synced? nil)))))
+        (when done (done))
+        (recur)))))
 
 (defn connect
   "Starts the connection: authenticates, then serves queued queries one at a
@@ -187,15 +219,10 @@
         (if (error? result)
           (loop []
             (when-let [{:keys [out]} (async/<! (:requests client))]
-              (async/>! out result)
+              (async/>! out [result])
               (async/close! out)
               (recur)))
-          (loop []
-            (when-let [request (async/<! (:requests client))]
-              (async/<! (run-query client request))
-              (when-let [done (:done request)]
-                (done))
-              (recur))))))
+          (serve client))))
     ready))
 
 (defn query
@@ -218,7 +245,7 @@
    batch. Such a query, like one with parameters, is one statement."
   ([client sql] (query client sql nil))
   ([client sql {:keys [cancel fetch-size]}]
-   (let [out       (async/chan 64)
+   (let [out       (async/chan 1 cat) ;; takes batches of rows; see batch-size
          cancelled (atom false)
          request   {:sql        (if (string? sql) sql (first sql))
                     :params     (when-not (string? sql) (mapv oid-types/param-text (rest sql)))
@@ -228,7 +255,7 @@
                     :cancelled  cancelled}]
      (when cancel
        ;; A put already parked on out outlives close!, so take until out is
-       ;; empty; run-query's next put is refused and it stops sending rows.
+       ;; empty; serve's next put is refused and it stops sending rows.
        (async/go
          (async/<! cancel)
          (reset! cancelled true)
