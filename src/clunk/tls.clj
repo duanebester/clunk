@@ -4,10 +4,9 @@
 
    TLS here is JSSE's SSLSocket layered over the connected SocketChannel's
    socket, with blocking streams. connect hands back a ByteChannel either
-   way, so the byte-buffer socket's read and write threads use it as they use
-   a SocketChannel; SSLSocket lets one thread read while another writes. A
-   blocking session loop on a virtual thread could take the SSLSocket's
-   streams directly instead. A non-blocking (selector) design would need
+   way, so the connection's reader thread reads it, and whoever starts a
+   query writes it, as they would a SocketChannel; SSLSocket lets one thread
+   read while another writes. A non-blocking (selector) design would need
    SSLEngine instead; a prototype of it benchmarked the same."
   (:require [clojure.string :as str]
             [clunk.messages :as messages]

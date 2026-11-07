@@ -1,14 +1,12 @@
 (ns clunk.message-socket
-  (:require [clojure.core.async :as async]
-            [clunk.pw :as pw]
-            [clunk.messages :as messages]
+  (:require [clunk.messages :as messages]
             [clunk.codecs :as codecs]
             [clunk.framing :as framing]
             [clunk.byte-buffer-socket :as bs]))
 
 #?(:cljs (enable-console-print!))
 
-(defrecord MessageSocket [buffer-socket in-ch out-ch])
+(defrecord MessageSocket [buffer-socket paused? drain])
 
 (defn connected?
   [^MessageSocket ms]
@@ -31,7 +29,9 @@
       83 (messages/handle-parameter-status bs)
       82 (messages/handle-authentication bs)
       75 (messages/handle-backend-key-data bs)
+      78 (messages/handle-error bs :NoticeResponse)
       69 (messages/handle-error bs)
+      65 (messages/handle-notification bs)
       68 (messages/handle-data-row bs)
       67 (messages/handle-command-complete bs)
       ;; Messages with no body worth reading.
@@ -71,55 +71,63 @@
          {:type :ErrorMessage :message (str "Could not decode message: " (ex-message e))})))
 
 (defn get-message-socket
-  "Every translation happens in the channels' transducers, as bytes are put on
-   :in by the socket and as messages are put on :out by the caller, so nothing
-   sits between the socket and its reader."
-  ([port] (get-message-socket port "localhost"))
-  ([port host] (get-message-socket port host nil))
-  ([port host ssl]
-   (let [in  (async/chan 64 (comp (framing/frames) (map decode)))
-         out (async/chan 64 (map handle-frontend))]
-     (map->MessageSocket {:buffer-socket (bs/get-buffer-socket port host in out ssl)
-                          :in            in
-                          :out           out}))))
+  "Connects; see byte-buffer-socket/get-buffer-socket. ssl is nil, or the TLS
+   settings clunk.tls/connect takes."
+  [port host ssl]
+  (map->MessageSocket {:buffer-socket (bs/get-buffer-socket port host ssl)
+                       :paused?       (volatile! false)
+                       :drain         (volatile! nil)}))
 
-(defn close-message-socket [{:keys [in out buffer-socket]
-                             :as   this}]
-  (bs/close-buffer-socket buffer-socket)
-  (async/close! in)
-  (async/close! out)
-  (assoc this :buffer-socket nil :in nil :out nil))
+(defn start!
+  "Calls on-message with each backend message, in order, as it arrives,
+   on-chunk-end after the messages of each socket read, and on-close once
+   the connection ends. On the JVM they run on the connection's reader
+   thread, which on-message may block to push back on the server. In JS,
+   they run from the socket's events, and on-message pushes back by calling
+   pause: no more messages are handled until resume."
+  [{:keys [buffer-socket paused? drain]} on-message on-chunk-end on-close]
+  #?(:clj  (let [rf ((framing/frames) (fn [_ view] (on-message (decode view)) nil))]
+             (bs/start! buffer-socket (fn [chunk] (rf nil chunk) (on-chunk-end)) on-close))
+     :cljs (let [views #js [] ;; framed, not yet handled from views[i]
+                 i     (volatile! 0)
+                 rf    ((framing/frames) (fn [_ view] (.push views view) nil))]
+             (vreset! drain (fn []
+                              (loop []
+                                (when (and (not @paused?) (< @i (.-length views)))
+                                  (let [view (aget views @i)]
+                                    (aset views @i nil)
+                                    (vswap! i inc)
+                                    (on-message (decode view))
+                                    (recur))))
+                              (when-not @paused?
+                                (set! (.-length views) 0)
+                                (vreset! i 0)
+                                (on-chunk-end))))
+             (bs/start! buffer-socket
+                        (fn [chunk]
+                          (rf nil chunk)
+                          ;; Messages still wait from the last read: stop reading
+                          ;; until they're handled.
+                          (if @paused? (bs/pause buffer-socket) (@drain)))
+                        on-close))))
 
-;; Example usage
-(comment
-  ;; clj -M -m cljs.main --target node --output-to ms.js -c clunk.message-socket && node ms.js
-  (def username "jimmy")
-  (def password "banana")
-  (def database "world")
+(defn send!
+  "Writes a frontend message, or a vector of messages, in one write."
+  [ms message]
+  (bs/write! (:buffer-socket ms) (handle-frontend message)))
 
-  (def message-socket (get-message-socket 5432))
+(defn pause
+  "JS only: stops handling messages until resume. The socket stops reading
+   too if another chunk arrives meanwhile."
+  [{:keys [paused?]}]
+  (vreset! paused? true))
 
-  (async/go-loop []
-    (when-let [message (async/<! (:in message-socket))]
-      (println message)
-      (case (:type message)
-        :AuthenticationMD5
-        ;; Respond with password
-        (let [salt     (:salt message)
-              password (pw/calculate-pw username password salt)]
-          (async/>! (:out message-socket) {:type     :PasswordMessage
-                                           :password password}))
-        nil)
-      (recur)))
+(defn resume [{:keys [buffer-socket paused? drain]}]
+  (vreset! paused? false)
+  (@drain)
+  (when-not @paused?
+    (bs/resume buffer-socket)))
 
-  (async/go
-    (async/>! (:out message-socket) {:type     :StartupMessage
-                                     :user     username
-                                     :database database}))
+(defn close-message-socket [ms]
+  (bs/close-buffer-socket (:buffer-socket ms)))
 
-  (async/go
-    (async/>! (:out message-socket) {:type     :Query
-                                     :query    "SELECT name FROM country LIMIT 3;"}))
-
-
-  (close-message-socket message-socket))

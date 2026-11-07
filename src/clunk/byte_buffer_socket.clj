@@ -1,8 +1,6 @@
 (ns clunk.byte-buffer-socket
-  (:require
-   [clojure.core.async :as async]
-   [clojure.tools.logging :as log]
-   [clunk.tls :as tls])
+  (:require [clojure.tools.logging :as log]
+            [clunk.tls :as tls])
   (:import
    (java.nio ByteBuffer)
    (java.nio.channels ByteChannel)
@@ -10,84 +8,76 @@
 
 ;; client is a connected SocketChannel, or a TLS connection behind the same
 ;; ByteChannel interface (see clunk.tls).
-(defrecord ByteBufferSocket [^ByteChannel client in-ch out-ch])
+(defrecord ByteBufferSocket [^ByteChannel client ^String reader-name])
 
 (defn connected? [^ByteChannel client]
   (.isOpen client))
 
-(defn- init-buffer-socket [^ByteChannel client in-ch out-ch]
-  (let [buff-sock (map->ByteBufferSocket {:client client
-                                          :in     in-ch
-                                          :out    out-ch})]
-    ;; Reads block, so they run on a real thread rather than a go block.
-    (async/thread
-      (let [bb (ByteBuffer/allocate 65536)]
-        (loop []
-          (let [n (try (.read client bb)
-                       (catch java.io.IOException _ -1))] ;; Socket closed under us
-            (if (neg? n)
-              ;; Close the socket first, so connected? is false by the time
-              ;; readers see in-ch close.
-              (do (.close client)
-                  (async/close! in-ch))
-              (let [chunk (Arrays/copyOf (.array bb) (int n))]
-                (.clear bb)
-                (when (async/>!! in-ch chunk) ;; Blocks while readers are behind
-                  (recur))))))))
-
-    (async/thread
-      (loop []
-        (when-let [^ByteBuffer bs (async/<!! out-ch)] ;; nil once out-ch is closed
-          (.flip bs)
-          (try (while (.hasRemaining bs)
-                 (.write client bs)) ;; Send it to SocketChannel
-               ;; A connection the server closed fails its write; the read
-               ;; loop already reports that to the query, so it's only debug.
-               (catch java.io.IOException e (log/debug e "Write to a closed connection"))
-               (catch Exception e (log/error e)))
-          (recur))))
-
-    buff-sock))
-
 (defn get-buffer-socket
-  "Puts each chunk read as a byte array on in-ch, and writes each ByteBuffer
-   taken from out-ch. Transducers on those channels do the rest. ssl is nil,
-   or the TLS settings clunk.tls/connect takes."
-  ([port address in-ch out-ch] (get-buffer-socket port address in-ch out-ch nil))
-  ([^Integer port ^String address in-ch out-ch ssl]
-   (init-buffer-socket (tls/connect port address ssl) in-ch out-ch)))
+  "Connects, blocking until the connection, and its TLS handshake if ssl asks
+   for one, is ready. ssl is nil, or the TLS settings clunk.tls/connect
+   takes. Throws if either fails."
+  [^Integer port ^String address ssl]
+  (->ByteBufferSocket (tls/connect port address ssl) (str "clunk-reader-" address ":" port)))
+
+(defn start!
+  "Calls on-chunk with each chunk read, as a byte array, then on-close once,
+   when the connection ends. Both run on the connection's own thread, named
+   clunk-reader-<host>:<port>, which reads for as long as the connection is
+   open, idle or not, so it sees messages the server sends unasked and notices
+   a server that hangs up. on-chunk may block it, which pushes back on the
+   server.
+
+   It's a daemon platform thread, not a virtual one: on a 24-thread machine a
+   platform reader handled up to half again as many small queries, at less
+   than half the CPU each, since waking a virtual thread blocked on a socket
+   also wakes the JDK's poller threads. A daemon, so a client nobody closed
+   doesn't keep the JVM running."
+  [{:keys [^ByteChannel client ^String reader-name]} on-chunk on-close]
+  (let [^Runnable read-loop
+        (bound-fn []
+          (let [bb (ByteBuffer/allocate 65536)]
+            (try
+              (loop []
+                (let [n (try (.read client bb)
+                             (catch java.io.IOException _ -1))] ;; Socket closed under us
+                  (when-not (neg? n)
+                    (let [chunk (Arrays/copyOf (.array bb) (int n))]
+                      (.clear bb)
+                      (on-chunk chunk)
+                      (recur)))))
+              (catch Throwable t
+                (log/error t "Closing the connection after an error reading it"))
+              (finally
+                ;; Closed first, so connected? is false by the time on-close runs.
+                (try (.close client) (catch java.io.IOException _))
+                (try (on-close)
+                     (catch Throwable t
+                       (log/error t "Error ending the connection's queries")))))))]
+    (doto (Thread. read-loop reader-name)
+      (.setDaemon true)
+      (.start)))
+  nil)
+
+(defn write!
+  "Writes a ByteBuffer whose position is at the end of its bytes, on the
+   caller's thread. SocketChannel and SSLSocket each keep concurrent writes
+   whole. clunk writes a query only once the server has answered the last
+   one, so the socket's send buffer is empty and only a request larger than
+   it waits for the server to read."
+  [{:keys [^ByteChannel client]} ^ByteBuffer bs]
+  (.flip bs)
+  (try (while (.hasRemaining bs)
+         (.write client bs))
+       ;; A connection the server closed fails its write; the read loop
+       ;; already reports that to the query, so it's only debug.
+       (catch java.io.IOException e (log/debug e "Write to a closed connection"))))
+
+;; The reader thread blocks to push back, so there's nothing to pause.
+(defn pause [_])
+(defn resume [_])
 
 (defn close-buffer-socket
-  "Idempotent: both the caller and the message socket's read loop close it."
-  [{:keys [in out ^ByteChannel client]
-    :as   this}]
-  (async/close! in)
-  (async/close! out)
-  (.close client)
-  (assoc this :client nil :in nil :out nil))
-
-;; Example usage
-(comment
-  ;; Utility fn
-  (defn print-ints
-    "Prints byte array as ints"
-    [ba]
-    (println (map #(int %) ba)))
-
-  (def buffer-socket (get-buffer-socket 5432 "localhost" (async/chan) (async/chan)))
-
-  ;; Startup message for user: "jimmy", and database: "world"
-  (def startup-bytes
-    (->>
-     (map byte [0 0 0 35 0 3 0 0 117 115 101 114 0 106 105 109 109 121 0 100 97 116 97 98 97 115 101 0 119 111 114 108 100 0 0])
-     byte-array
-     ByteBuffer/wrap))
-
-  ;; Send ByteBuffer message
-  (async/>!! (:out buffer-socket) startup-bytes)
-
-  ;; Print received Message
-  (print-ints (.array (async/<!! (:in buffer-socket))))
-
-  ;; Close
-  (close-buffer-socket buffer-socket))
+  "Idempotent."
+  [{:keys [^ByteChannel client]}]
+  (.close client))

@@ -134,6 +134,48 @@
        (t/is (= [{:n 7}] (deref (clunk/execute c "SELECT 7::int4 AS n") 5000 :timed-out)))
        (clunk/close c))))
 
+#?(:clj
+   (t/deftest a-query-that-takes-a-connection-as-it-drops-still-ends
+     ;; The window between submit taking the idle connection and start!
+     ;; setting the running query, played in order: the server hangs up in
+     ;; it, so on-close finds no query to end.
+     (let [admin (clunk/client config)
+           c     (clunk/client config)
+           _     (async/<!! (clunk/connect admin))
+           _     (async/<!! (clunk/connect c))
+           pid   (:pid (first @(clunk/execute c "SELECT pg_backend_pid() AS pid")))
+           ended (async/promise-chan)
+           req   {:sql "SELECT 1" :fetch-size 0 :cancelled (atom false)
+                  :sink (reify clunk/Sink
+                          (-row! [_ _ _] true)
+                          (-flush! [_ _] true)
+                          (-error! [_ _ err] (async/put! ended err) true)
+                          (-end! [_ _] (async/put! ended :ended)))}]
+       (swap! (:state c) assoc :busy? true)
+       @(clunk/execute admin ["SELECT pg_terminate_backend($1::int4)" pid])
+       (t/is (= :failed (first (async/alts!! [(async/go-loop []
+                                                 (let [p (:phase @(:state c))]
+                                                   (if (= :failed p) p (do (async/<! (async/timeout 10)) (recur)))))
+                                               (async/timeout 5000)]))))
+       (#'clunk/start! c req)
+       (t/is (= "Connection closed during query"
+                (ex-message (first (async/alts!! [ended (async/timeout 3000)])))))
+       (clunk/close admin))))
+
+#?(:clj
+   (t/deftest each-connection-reads-on-a-daemon-thread-of-its-own
+     (let [readers #(set (filter (fn [^Thread t] (= "clunk-reader-localhost:5432" (.getName t)))
+                                 (keys (Thread/getAllStackTraces))))
+           before  (readers)
+           c       (clunk/client config)
+           _       (async/<!! (clunk/connect c))
+           [^Thread reader :as new] (vec (remove before (readers)))]
+       (t/is (= 1 (count new)))
+       (t/is (.isDaemon reader))
+       (clunk/close c)
+       (.join reader 2000)
+       (t/is (not (.isAlive reader)) "the reader ends once the connection is closed"))))
+
 (t/deftest a-cancelled-query-closes-early-and-the-next-one-runs
   (let [c (clunk/client config)]
     (run (async/go

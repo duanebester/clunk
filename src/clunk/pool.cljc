@@ -30,7 +30,7 @@
                     (ex-info (str "Could not connect: " (ex-message e)) {} e))))
      :cljs (async/to-chan! [(clunk/client config)])))
 
-(declare free-slot!)
+(declare free-slot! checkin!)
 
 (defn- open!
   "Opens a client in a slot already counted in :size and calls lend with it,
@@ -45,7 +45,7 @@
         (do (when-not (clunk/error? c) (clunk/close c))
             (free-slot! pool)
             (lend err))
-        (lend c)))))
+        (when-not (lend c) (checkin! pool c))))))
 
 (defn- free-slot!
   "Gives up a slot whose client is gone: the next waiter gets a new client in
@@ -61,7 +61,8 @@
 (defn- checkout!
   "Calls lend with a client, now if one is idle or the pool can grow, else
    once one is checked in. Calls it with an error if connecting fails or the
-   pool is closed."
+   pool is closed. lend returns false if it didn't take the client, so it
+   goes to the next waiter."
   [{:keys [state max-size] :as pool} lend]
   (let [[{:keys [closed? idle size]}]
         (swap-vals! state (fn [{:keys [closed? idle size] :as s}]
@@ -74,46 +75,58 @@
                               ;; The server may have hung up while it sat idle;
                               ;; if so, a new client takes its slot.
                               (if (connected? c)
-                                (lend c)
+                                (when-not (lend c) (checkin! pool c))
                                 (do (clunk/close c)
                                     (open! pool lend))))
           (< size max-size) (open! pool lend))))
 
 (defn- checkin!
-  "Takes back a client whose query has finished: it goes to the next waiter,
-   or back to :idle. A client that has lost its connection is closed instead."
+  "Takes back a client whose query has finished: it goes to the next waiter
+   that still wants it, or back to :idle. A client that has lost its
+   connection is closed instead. A loop rather than a call inside a call, so
+   a long run of cancelled waiters stays off the stack."
   [{:keys [state] :as pool} c]
   (if (connected? c)
-    (let [[{:keys [closed? waiters]}]
-          (swap-vals! state (fn [{:keys [closed? waiters] :as s}]
-                              (cond closed?       s
-                                    (seq waiters) (update s :waiters pop)
-                                    :else         (update s :idle conj c))))]
-      (cond closed?       (do (clunk/close c) (free-slot! pool))
-            (seq waiters) ((peek waiters) c)))
+    (loop []
+      (let [[{:keys [closed? waiters]}]
+            (swap-vals! state (fn [{:keys [closed? waiters] :as s}]
+                                (cond closed?       s
+                                      (seq waiters) (update s :waiters pop)
+                                      :else         (update s :idle conj c))))]
+        (cond closed?       (do (clunk/close c) (free-slot! pool))
+              (seq waiters) (when-not ((peek waiters) c) (recur)))))
     (do (clunk/close c)
         (free-slot! pool))))
 
-(defrecord Pool [config max-size state]
+(defn- usable? [c]
+  (and (connected? c) (not= :failed (:phase @(:state c)))))
+
+(defrecord Pool [config max-size state listen-client]
   clunk/Queryable
-  (submit [this {:keys [out cancel cancelled] :as request}]
+  (submit [this request]
     (checkout! this (fn [c]
-                      (if (clunk/error? c)
-                        (async/put! out [c] (fn [_] (async/close! out)))
-                        ;; A go block, so a long run of cancelled waiters, each
-                        ;; handing the client to the next, stays off the stack.
-                        (async/go
-                          ;; A query cancelled while it waited must not run.
-                          ;; query's watcher sets cancelled only once the
-                          ;; dispatch pool resumes it, which can be after this,
-                          ;; so look at cancel itself too: closed, or holding a
-                          ;; value. Taking that value means the watcher never
-                          ;; fires, so close out here.
-                          (if (or @cancelled
-                                  (and cancel (not= :default (second (async/alts! [cancel] :default nil)))))
-                            (do (async/close! out)
-                                (checkin! this c))
-                            (clunk/submit c (assoc request :done #(checkin! this c)))))))))
+                      (cond
+                        (clunk/error? c)          (do (clunk/fail! request c) true)
+                        ;; A query cancelled while it waited must not run.
+                        (clunk/cancelled? request) (do (clunk/fail! request nil) false)
+                        :else                     (do (clunk/submit c (assoc request :done #(checkin! this c)))
+                                                      true)))))
+  (listener [_]
+    ;; One connection, made when first needed, carries every listener.
+    (clunk/with-lock listen-client
+      (fn []
+        (let [c @listen-client]
+          (cond
+            (:closed? @state)   (closed-error)
+            (and c (usable? c)) c
+            :else
+            (let [c (try (clunk/client config)
+                         (catch #?(:clj Exception :cljs :default) e
+                           (ex-info (str "Could not connect: " (ex-message e)) {} e)))]
+              (when-not (clunk/error? c)
+                (clunk/connect c)
+                (reset! listen-client c))
+              c))))))
   (close [this]
     (let [[{:keys [idle waiters]}]
           (swap-vals! state (fn [{:keys [idle waiters] :as s}]
@@ -122,6 +135,7 @@
                                   (update :size - (count idle)))))]
       (run! clunk/close idle)
       (run! #(% (closed-error)) waiters)
+      (clunk/with-lock listen-client #(some-> @listen-client clunk/close))
       this)))
 
 (defn pool
@@ -131,10 +145,12 @@
    holds its client until its rows are all read or it is cancelled; queries
    beyond :max-size wait their turn. A client whose connection was lost is
    replaced. clunk.core/close closes the idle clients at once, and the busy
-   ones as their queries finish."
+   ones as their queries finish. clunk.core/listen on a pool listens on one
+   more client, which the pool never lends to queries."
   [config]
   (map->Pool {:config   config
               :max-size (get config :max-size 10)
+              :listen-client (atom nil)
               :state    (atom {:idle    ()
                                :size    0
                                :waiters #?(:clj  clojure.lang.PersistentQueue/EMPTY

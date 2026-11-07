@@ -1,7 +1,5 @@
 (ns clunk.byte-buffer-socket
-  (:require
-   [cljs.core.async :as async]
-   [clunk.tls :as tls]))
+  (:require [clunk.tls :as tls]))
 
 (defn connected?
   "True until the socket is destroyed, as it is once the server hangs up.
@@ -10,7 +8,7 @@
   (not (.-destroyed client)))
 
 ;; client is a net.Socket, or with TLS a Duplex that acts like one (see clunk.tls).
-(defrecord ByteBufferSocket [client in-ch out-ch])
+(defrecord ByteBufferSocket [client])
 
 (defn- chunk->buffer
   "Copies a Node Buffer's bytes into their own ArrayBuffer. A Buffer can be a
@@ -18,58 +16,41 @@
   [^js d]
   (.slice (.-buffer d) (.-byteOffset d) (+ (.-byteOffset d) (.-length d))))
 
-(defn- init-buffer-socket [^js client in-ch out-ch]
-  (let [buff-sock  (map->ByteBufferSocket {:client  client
-                                           :in      in-ch
-                                           :out     out-ch})]
-
-    ;; Pause reading until the chunk is accepted, so a slow reader pushes back on the server.
-    (.on client "data" (fn [d]
-                         (.pause client)
-                         (async/put! in-ch (chunk->buffer d) (fn [_] (.resume client)))))
-    (.on client "close" (fn [_] (async/close! in-ch))) ;; Tell readers the server hung up
+(defn get-buffer-socket
+  "Starts connecting and returns at once; writes wait until the connection is
+   ready. ssl is nil, or the TLS settings clunk.tls/connect takes."
+  [^Integer port ^String address ssl]
+  (let [client (tls/connect port address ssl)]
     ;; An unhandled "error" (refused, reset) would crash the process; the
     ;; "close" that follows it ends the connection instead.
     (.on client "error" (fn [_]))
+    (->ByteBufferSocket client)))
 
-    (async/go-loop []
-      (when (connected? (:client buff-sock))
-        (when-let [bs (async/<! out-ch)] ;; nil once out-ch is closed
-          (.write client (js/Uint8Array. (.-buffer bs))) ;; Send it to the socket
-          (recur))))
+(defn start!
+  "Calls on-chunk with each chunk read, as an ArrayBuffer, then on-close once
+   the connection ends."
+  [{:keys [^js client]} on-chunk on-close]
+  (.on client "data" (fn [d]
+                       (try (on-chunk (chunk->buffer d))
+                            (catch :default e
+                              (js/console.error "clunk: closing the connection" e)
+                              (.destroy client)))))
+  (.on client "close" (fn [_] (on-close))))
 
-    buff-sock))
+(defn write!
+  "Writes a binf view (a DataView); Node buffers what the socket can't take yet."
+  [{:keys [^js client]} bs]
+  (when (connected? client)
+    (.write client (js/Uint8Array. (.-buffer bs)))))
 
-(defn get-buffer-socket
-  "Puts each chunk read as an ArrayBuffer on in-ch, and writes each view taken
-   from out-ch. Transducers on those channels do the rest. ssl is nil, or the
-   TLS settings clunk.tls/connect takes."
-  ([port address in-ch out-ch] (get-buffer-socket port address in-ch out-ch nil))
-  ([^Integer port ^String address in-ch out-ch ssl]
-   (init-buffer-socket (tls/connect port address ssl) in-ch out-ch)))
+(defn pause
+  "Stops reading until resume, so a slow reader pushes back on the server."
+  [{:keys [^js client]}]
+  (.pause client))
 
-(defn close-buffer-socket [{:keys [in out client]
-                            :as   this}]
-  (when true
-    (async/close! in)
-    (async/close! out)
-    (.end client)
-    (assoc this :client nil :in nil :out nil)))
+(defn resume [{:keys [^js client]}]
+  (when (.isPaused client)
+    (.resume client)))
 
-;; Example usage:
-(comment
-  ;; Connect socket to postgres
-  (def buffer-socket (get-buffer-socket 5432 "localhost" (async/chan) (async/chan)))
-  ;; startup message for user: "jimmy" and database: "world"
-  (def startup-bytes (to-array [0 0 0 35 0 3 0 0 117 115 101 114 0 106 105 109 109 121 0 100 97 116 97 98 97 115 101 0 119 111 114 108 100 0 0]))
-
-  (def buff (js/DataView. (js/ArrayBuffer. (count startup-bytes))))
-  (doseq [i (range (count startup-bytes))]
-    (.setUint8 buff i (aget startup-bytes i)))
-
-  ;; Send byte buffer message
-  (async/go
-    (async/>! (:out buffer-socket) buff)
-  ;; Print received Message
-    (println (async/<! (:in buffer-socket)))
-    (close-buffer-socket buffer-socket)))
+(defn close-buffer-socket [{:keys [^js client]}]
+  (.end client))

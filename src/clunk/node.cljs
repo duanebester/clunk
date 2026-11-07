@@ -92,6 +92,42 @@
      (aset it js/Symbol.asyncIterator (fn [] it))
      it)))
 
+(defn listen
+  "listen(client or pool, channel) is an async iterable of the notifications
+   sent on a LISTEN channel, each {channel, payload, pid}, for for-await.
+   Leaving the loop (break) stops listening. It rejects if the connection
+   drops or the listener falls 1000 notifications behind."
+  [client channel]
+  (let [ch (clunk/listen client channel)
+        it #js {:next   (fn []
+                          (js/Promise.
+                           (fn [resolve reject]
+                             (async/take! ch (fn [n]
+                                               (cond
+                                                 (nil? n)         (resolve #js {:done true})
+                                                 (clunk/error? n) (reject (js-error n))
+                                                 :else            (resolve #js {:done false :value (clj->js n)})))))))
+                :return (fn []
+                          (some-> (clunk/unlisten client ch) (.catch (fn [_])))
+                          (js/Promise.resolve #js {:done true}))}]
+    (aset it js/Symbol.asyncIterator (fn [] it))
+    it))
+
+(defn unlisten
+  "unlisten(client or pool, channel) ends every listen on channel, and
+   resolves once the server has stopped sending its notifications."
+  [client channel]
+  (-> (or (clunk/unlisten client channel) (js/Promise.resolve nil))
+      (.then (fn [_] js/undefined) #(throw (js-error %)))))
+
+(defn notify
+  "notify(client or pool, channel, payload) sends payload, a string, to the
+   channel's listeners with pg_notify."
+  [client channel payload]
+  (.then (clunk/notify client channel payload)
+         (fn [_] js/undefined)
+         #(throw (js-error %))))
+
 (defn close [client]
   (clunk/close client)
   nil)

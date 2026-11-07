@@ -4,11 +4,14 @@
 {:deps   {:aliases [:cljs]}
  :builds {:node {:target    :node-library
                  :output-to "target/node/clunk.js"
-                 :exports   {:connect clunk.node/connect
-                             :pool    clunk.node/pool
-                             :query   clunk.node/query
-                             :stream  clunk.node/stream
-                             :close   clunk.node/close}}
+                 :exports   {:connect  clunk.node/connect
+                             :pool     clunk.node/pool
+                             :query    clunk.node/query
+                             :stream   clunk.node/stream
+                             :listen   clunk.node/listen
+                             :unlisten clunk.node/unlisten
+                             :notify   clunk.node/notify
+                             :close    clunk.node/close}}
           ;; Pool stress test, not in the suite; see stress/clunk/stress.cljs.
           :stress {:target    :node-script
                    :main      clunk.stress/main

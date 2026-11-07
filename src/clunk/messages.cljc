@@ -64,18 +64,31 @@
 
 (defn handle-error
   "Each field is a type byte and a string; S is severity, C the SQLSTATE code,
-   and M the message."
-  ([bs] (handle-error bs [] {}))
-  ([bs errs fields]
+   and M the message. A NoticeResponse has the same fields."
+  ([bs] (handle-error bs :ErrorMessage))
+  ([bs type] (handle-error bs type [] {}))
+  ([bs type errs fields]
    (let [head (binf/rr-i8 bs)]
      (if (< 0 head)
        (let [msg (codecs/rr-cstring bs)]
-         (recur bs (conj errs msg) (assoc fields (char head) msg)))
-       {:type     :ErrorMessage
+         (recur bs type (conj errs msg) (assoc fields (char head) msg)))
+       {:type     type
         :errors   errs
         :severity (get fields \S)
         :code     (get fields \C)
         :message  (get fields \M)}))))
+
+(defn handle-notification
+  "A NOTIFY on a channel this connection listens on: the notifying backend's
+   pid, the channel and the payload."
+  [bs]
+  (let [pid     (binf/rr-i32 bs)
+        channel (codecs/rr-cstring bs)
+        payload (codecs/rr-cstring bs)]
+    {:type    :NotificationResponse
+     :pid     pid
+     :channel channel
+     :payload payload}))
 
 (defn handle-command-complete [bs]
   {:type :CommandComplete

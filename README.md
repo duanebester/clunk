@@ -119,15 +119,17 @@ To stream a large result, hand `plan` to a response body. With the Ring Jetty ad
    :body    (ndjson (clunk/plan db "SELECT name, population FROM city"))})
 ```
 
-In an asynchronous Ring handler, complete the response from the future. Clojure 1.12 passes the `fn` as the `BiConsumer` that `whenComplete` takes:
+In an asynchronous Ring handler, complete the response from the future. Clojure 1.12 passes the `fn` as the `BiConsumer` that `whenCompleteAsync` takes.
+
+The future completes on the thread that reads the connection, so a function given to `whenComplete`, `thenApply` or the like runs there, and the connection reads nothing more until it returns. It must not block, and must never wait for another query on the same client or pool: a pool may lend that very connection to the query, which then waits forever. `whenCompleteAsync` and the other `…Async` methods run it on another thread, so use them for anything that does real work, such as rendering a response:
 
 ```clj
 (defn countries-async [_request respond raise]
-  (.whenComplete (clunk/execute db "SELECT name FROM country ORDER BY name")
-                 (fn [rows err]
-                   (if err
-                     (raise err)
-                     (respond {:status 200 :body (json/write-str rows)})))))
+  (.whenCompleteAsync (clunk/execute db "SELECT name FROM country ORDER BY name")
+                      (fn [rows err]
+                        (if err
+                          (raise err)
+                          (respond {:status 200 :body (json/write-str rows)})))))
 ```
 
 #### core.async
@@ -163,6 +165,22 @@ Inside a go block, `<query!` parks until the query finishes and returns all its 
   (println (clunk/<query! client "SELECT 1::int4 AS one;")))
 ;; [{:one 1}]
 ```
+
+#### LISTEN and NOTIFY
+
+`listen` sends `LISTEN` and returns a channel of the notifications sent on that channel name, from any connection, as maps of `:channel`, `:payload`, and the notifying backend's `:pid`. They arrive whenever the server sends them, while the connection is idle or between a query's results. `notify` sends one with `pg_notify` and returns a future, or a js Promise, of `nil`:
+
+```clj
+(def events (clunk/listen client "events"))
+
+@(clunk/notify db "events" "naïve café 🐘")
+(async/<!! events)
+;; {:channel "events", :payload "naïve café 🐘", :pid 4242}
+
+(clunk/unlisten client events) ;; or a channel name, to end all its listeners
+```
+
+The connection never waits for a listener: one that leaves `:max-queued` notifications untaken (`(clunk/listen client "events" {:max-queued 1000})` is the default) gets an error value and closes instead. If the connection drops, every listener gets an error value and closes. `unlisten` closes the channel and sends `UNLISTEN` once no listener is left on the name; closing the channel yourself does the same when its next notification arrives. On a pool, listeners share one connection of their own, which the pool never lends to queries and doesn't count toward `:max-size`.
 
 ```clj
 (clunk/close client)
@@ -246,6 +264,20 @@ app.get('/cities', () => {
 });
 serve({ fetch: app.fetch, port: 3000 });
 ```
+
+`listen` is an async iterable of the notifications on a channel name, which leaving the loop unlistens, and `notify` sends one. As on the JVM, a pool listens on a connection of its own:
+
+```js
+for await (const { channel, payload, pid } of clunk.listen(pool, 'events')) {
+  console.log(payload);
+  if (payload === 'stop') break;
+}
+
+// Anywhere else:
+await clunk.notify(pool, 'events', 'stop');
+```
+
+`unlisten(pool, 'events')` ends every `listen` on the name. A listener rejects if its connection drops, or if it falls 1000 notifications behind.
 
 ### Running The Tests
 
