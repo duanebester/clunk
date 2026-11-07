@@ -55,14 +55,22 @@
   [sql params]
   (if params (into [sql] params) sql))
 
+;; query's sink: collects the rows, which the row decoder has made JS
+;; objects, straight into the array query resolves to.
+(deftype Rows [rows ok fail ^:mutable err]
+  clunk/Sink
+  (-row! [_ _ row] (.push rows row) true)
+  (-flush! [_ _] true)
+  (-error! [_ _ e] (when-not err (set! err e)) true)
+  (-end! [_ _] (if err (fail (js-error err)) (ok rows))))
+
 (defn query
   "query(client or pool, sql, params?) resolves to an array of row objects.
    params is an array of the values of $1, $2, ... in sql."
   ([client sql] (query client sql nil))
   ([client sql params]
-   (.then (clunk/execute client (sql-params sql params))
-          clj->js
-          #(throw (js-error %)))))
+   (js/Promise. (fn [ok fail]
+                  (clunk/query client (sql-params sql params) (Rows. #js [] ok fail nil) {:js-rows? true})))))
 
 (def ^:private read-ahead
   "Rows a stream holds for its reader before it pauses the connection, which
@@ -70,8 +78,9 @@
    ask the server for another."
   64)
 
-;; What stream and listen read from: a Sink for stream's rows and a Listener
-;; for listen's notifications, which holds them until next takes them.
+;; What stream and listen read from: a Sink for stream's rows, which the row
+;; decoder has made JS objects, and a Listener for listen's notifications,
+;; made JS objects as they arrive. It holds them until next takes them.
 ;;   buf      items not yet taken
 ;;   waiting  the resolve and reject of a next made while buf was empty
 ;;   ended    true once the query or listener has ended, after err if any
@@ -85,7 +94,7 @@
     (if waiting
       (let [[ok] waiting]
         (set! waiting nil)
-        (ok #js {:done false :value (clj->js x)}))
+        (ok #js {:done false :value x}))
       (.push buf x)))
   (settle [_]
     (when (and waiting (zero? (.-length buf)) (or err ended))
@@ -103,7 +112,7 @@
       (let [x (.shift buf)]
         ;; Resumed only once all are taken, as rows then arrive in runs.
         (when (zero? (.-length buf)) (.resume this))
-        (js/Promise.resolve #js {:done false :value (clj->js x)}))
+        (js/Promise.resolve #js {:done false :value x}))
       (js/Promise. (fn [ok fail]
                      (set! waiting [ok fail])
                      (.settle this)))))
@@ -139,7 +148,7 @@
   (-notify! [this n]
     (cond stopped                        false
           (<= max-queued (.-length buf)) :full
-          :else                          (do (.put this n) true)))
+          :else                          (do (.put this (clj->js n)) true)))
   (-stop! [this e]
     (set! err e)
     (set! ended true)
@@ -168,7 +177,7 @@
   ([client sql params]
    (let [token (clunk/cancel-token)
          f     (feed nil (fn [_] (clunk/cancel! token)))]
-     (clunk/query client (sql-params sql params) f {:cancel token})
+     (clunk/query client (sql-params sql params) f {:cancel token :js-rows? true})
      (iterator f))))
 
 (defn listen

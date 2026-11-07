@@ -92,6 +92,10 @@
            ;; 2^53 + 1 is the first int8 a JS number can't hold.
            (t/is (= [{:l #?(:clj 9007199254740993 :cljs "9007199254740993") :g 0.1 :t "text"}]
                     (async/<! (exec c "SELECT 9007199254740993::int8 AS l, 0.1::float8 AS g, 'text'::text AS t"))))
+           ;; Numbers are read from their bytes: doubles of up to 15 digits,
+           ;; and longer ones and exponents as text. Both round as parsing does.
+           (t/is (= [{:i -2147483648 :a -1234.5625 :b 0.30000000000000004 :c 123456789012345.6 :d 1.0E300 :e -1.0E-5}]
+                    (async/<! (exec c "SELECT (-2147483648)::int4 AS i, -1234.5625::float8 AS a, 0.30000000000000004::float8 AS b, 123456789012345.6::float8 AS c, 1e300::float8 AS d, -0.00001::float8 AS e"))))
            (clunk/close c)))))
 
 (def ^:private decoder oid-types/decoder)
@@ -111,7 +115,7 @@
            ;; value it doesn't expect (NaN for a JVM numeric, say). NULL isn't decoded.
            (set-decoder! (fn [oid]
                            (if (= 600 oid)
-                             (fn [_ _] (throw #?(:clj (IllegalArgumentException. "bad point") :cljs (js/Error. "bad point"))))
+                             (fn [_ _ _] (throw #?(:clj (IllegalArgumentException. "bad point") :cljs (js/Error. "bad point"))))
                              (decoder oid))))
            ;; The rows before it arrive, then its error, and nothing after it.
            (let [rows (async/<! (collect c sql))]
@@ -310,6 +314,8 @@
            (async/<! (settle (clunk/connect c)))
            (t/is (= [{:city "Zürich"}] (async/<! (exec c "SELECT 'Zürich' AS city"))))
            (t/is (= [{:s "🦀🐘" :n 8}] (async/<! (exec c "SELECT '🦀🐘' AS s, octet_length('🦀🐘') AS n"))))
+           ;; A leading byte order mark is text like any other.
+           (t/is (= [{:s "\uFEFFbom"}] (async/<! (exec c "SELECT E'\\uFEFFbom' AS s"))))
            ;; The user name goes in the startup message; SCRAM hashes the password.
            (async/<! (exec c "DROP ROLE IF EXISTS \"clünk_test\""))
            (async/<! (exec c "CREATE ROLE \"clünk_test\" LOGIN PASSWORD 'pässwörd'"))

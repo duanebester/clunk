@@ -65,7 +65,7 @@
             pid     #(async/go (get (first (js->clj (<p! (node/query p "SELECT pg_backend_pid() AS pid")))) "pid"))
             before  (async/<! (pid))
             sql     "SELECT 1::int4 AS n, point(1, 2) AS p"]
-        (set! oid-types/decoder #(if (= 600 %) (fn [_ _] (throw (js/Error. "bad point"))) (decoder %)))
+        (set! oid-types/decoder #(if (= 600 %) (fn [_ _ _] (throw (js/Error. "bad point"))) (decoder %)))
         (let [err (async/<! (rejection (node/query p sql)))]
           (t/is (instance? js/Error err))
           (t/is (not (instance? ExceptionInfo err)))

@@ -1,6 +1,7 @@
 (ns clunk.oid-types
-  (:require [clunk.vendor.binf :as binf])
-  #?(:clj (:import (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZoneOffset))))
+  #?(:clj (:import (java.nio.charset StandardCharsets)
+                   (java.time LocalDate LocalDateTime LocalTime OffsetDateTime OffsetTime ZoneOffset)
+                   (java.util Arrays))))
 
 ;; Dates and times arrive in Postgres's ISO text format (DateStyle ISO, the
 ;; default), such as "2026-11-05 07:45:01.5-06". Years have at least four
@@ -60,12 +61,85 @@
       (time-parts s (+ dash 7) end ps))
     ps))
 
+;; ---- reading a value's bytes
+;;
+;; A decoder reads one value from b, the bytes of the DataRow it came in: a
+;; byte array on the JVM and a Node Buffer in JS, the n bytes from index off.
+
+(defn- byte-at
+  "The byte at index i of b. Only ever compared with ASCII, so a JVM byte's
+   sign doesn't matter."
+  ^long [b ^long i]
+  #?(:clj (long (aget ^bytes b i)) :cljs (aget b i)))
+
+(defn text
+  "The value's bytes as UTF-8 text. In JS, Buffer's toString decodes them in
+   place, at about half the cost of a TextDecoder and the Uint8Array it needs.
+   Like the JVM, it keeps a leading byte order mark, which TextDecoder drops."
+  ^String [b off n]
+  #?(:clj  (String. ^bytes b (int off) (int n) StandardCharsets/UTF_8)
+     :cljs (.toString b "utf8" off (+ off n))))
+
+(defn- raw
+  "A copy of the value's bytes: a byte array on the JVM, an ArrayBuffer in JS."
+  [b off n]
+  #?(:clj  (Arrays/copyOfRange ^bytes b (int off) (int (+ off n)))
+     :cljs (let [start (+ (.-byteOffset b) off)]
+             (.slice (.-buffer b) start (+ start n)))))
+
+(defn- integer
+  "The integer written in the value's bytes: an optional minus sign, then
+   digits, as Postgres writes int2, int4, int8 and oid. It counts down from
+   0, so the most negative int8 doesn't overflow on the way, and (- 0 v)
+   keeps JS from returning -0 for 0."
+  ^long [b ^long off ^long n]
+  (let [end  (+ off n)
+        minus? (== 45 (byte-at b off))]
+    (loop [i (if minus? (inc off) off)
+           v 0]
+      (if (< i end)
+        (recur (inc i) (- (* 10 v) (- (byte-at b i) 48)))
+        (if minus? v (- 0 v))))))
+
+(def ^:private powers-of-ten
+  "10^0 to 10^15, each exact as a double."
+  #?(:clj  (double-array (take 16 (iterate #(* 10.0 %) 1.0)))
+     :cljs (into-array (take 16 (iterate #(* 10 %) 1)))))
+
+(defn- float8
+  "The double written in the value's bytes. Most values, digits with an
+   optional point and at most 15 digits in all, are read from the bytes: the
+   digits as a whole number and the power of ten are both exact doubles, so
+   one division rounds as parsing the text does. Anything else (more digits,
+   an exponent, NaN, Infinity) is parsed as text."
+  [b ^long off ^long n]
+  (let [end  (+ off n)
+        minus? (== 45 (byte-at b off))]
+    (loop [i      (if minus? (inc off) off)
+           m      0
+           point  -1
+           digits 0]
+      (if (< i end)
+        (let [c (byte-at b i)]
+          (cond (and (<= 48 c) (<= c 57) (< digits 15)) (recur (inc i) (+ (* 10 m) (- c 48)) point (inc digits))
+                (and (== 46 c) (neg? point))            (recur (inc i) m i digits)
+                :else                                   (recur end 0 -1 16)))
+        (if (and (<= 1 digits) (<= digits 15))
+          (let [x (if (neg? point)
+                    (double m)
+                    (/ (double m) (aget #?(:clj ^doubles powers-of-ten :cljs powers-of-ten) (- end point 1))))]
+            (if minus? (- x) x))
+          #?(:clj  (Double/parseDouble (text b off n))
+             :cljs (js/parseFloat (.toString b "latin1" off end))))))))
+
+;; ----
+
 (defn- infinite
   "Reads a value that may be infinity or -infinity, which no date type holds:
    those return pos or neg, and anything else goes through parse."
   [pos neg parse]
-  (fn [view n]
-    (let [s (binf/rr-string view n)]
+  (fn [b off n]
+    (let [s (text b off n)]
       (case (.charAt ^String s 0)
         \i pos
         \- neg
@@ -102,57 +176,53 @@
   (+ (bit-and c 15) (* 9 (bit-shift-right c 6))))
 
 (defn- bytea
-  "Decodes bytea's hex text, \\x then two digits per byte, straight from the
-   view's bytes. The older escape format, used only when the server sets
+  "Decodes bytea's hex text, \\x then two digits per byte, straight from its
+   bytes. The older escape format, used only when the server sets
    bytea_output to escape, comes back as its raw text bytes."
-  [view n]
-  (let [pos (binf/position view)]
-    (if (and (<= 2 n) (= 120 (binf/ra-u8 view (inc pos)))) ;; \x
-      (let [len (quot (- n 2) 2)]
-        (binf/skip view n)
-        #?(:clj (let [^bytes src (binf/backing-buffer view)
-                      out        (byte-array len)]
-                  (loop [i 0 j (+ (binf/buffer-offset view) pos 2)]
-                    (when (< i len)
-                      (aset out i (unchecked-byte (bit-or (bit-shift-left (hex-value (aget src j)) 4)
-                                                          (hex-value (aget src (inc j))))))
-                      (recur (inc i) (+ j 2))))
-                  out)
-           :cljs (let [out (js/Uint8Array. len)]
-                   (loop [i 0 j (+ pos 2)]
-                     (when (< i len)
-                       (aset out i (bit-or (bit-shift-left (hex-value (.getUint8 view j)) 4)
-                                           (hex-value (.getUint8 view (inc j)))))
-                       (recur (inc i) (+ j 2))))
-                   (.-buffer out))))
-      (binf/rr-buffer view n))))
+  [b off n]
+  (if (and (<= 2 n) (== 120 (byte-at b (inc off)))) ;; \x
+    (let [len (quot (- n 2) 2)]
+      #?(:clj (let [^bytes src b
+                    out        (byte-array len)]
+                (loop [i 0 j (+ off 2)]
+                  (when (< i len)
+                    (aset out i (unchecked-byte (bit-or (bit-shift-left (hex-value (aget src j)) 4)
+                                                        (hex-value (aget src (inc j))))))
+                    (recur (inc i) (+ j 2))))
+                out)
+         :cljs (let [out (js/Uint8Array. len)]
+                 (loop [i 0 j (+ off 2)]
+                   (when (< i len)
+                     (aset out i (bit-or (bit-shift-left (hex-value (aget b j)) 4)
+                                         (hex-value (aget b (inc j)))))
+                     (recur (inc i) (+ j 2))))
+                 (.-buffer out))))
+    (raw b off n)))
 
 (defn decoder
-  "Returns a function of (view n-byte) that reads one column value of the given
-   type from the view's current position. Simple queries always return values
-   in text format, so each type parses its text. Unknown OIDs return the raw
-   bytes."
+  "Returns a function of (b off n) that reads one column value of the given
+   type from n bytes of b, its DataRow's bytes, starting at index off: b is a
+   byte array on the JVM and a Node Buffer in JS. Simple queries always
+   return values in text format, so each type parses its text. Unknown OIDs
+   return the raw bytes."
   [oid]
   (case (int oid)
-    16                       (fn [view n] (= "t" (binf/rr-string view n)))
+    16                       (fn [b off _] (== 116 (byte-at b off))) ;; t
     17                       bytea
     ;; int2 and int4 both read as an int, as pgJDBC does.
-    (21 23)                  (fn [view n] #?(:clj (Integer/parseInt (binf/rr-string view n))
-                                             :cljs (js/parseInt (binf/rr-string view n) 10)))
+    (21 23)                  #?(:clj (fn [b off n] (int (integer b off n)))
+                                :cljs integer)
     ;; int8 overflows a JS number past 2^53, so Node gets a string, as
     ;; node-postgres does.
-    20                       (fn [view n] #?(:clj (Long/parseLong (binf/rr-string view n))
-                                             :cljs (binf/rr-string view n)))
+    20                       #?(:clj integer :cljs text)
     ;; oid is unsigned, so it can overflow an int.
-    26                       (fn [view n] #?(:clj (Long/parseLong (binf/rr-string view n))
-                                             :cljs (js/parseInt (binf/rr-string view n) 10)))
-    700                      (fn [view n] #?(:clj (Float/parseFloat (binf/rr-string view n))
-                                             :cljs (js/parseFloat (binf/rr-string view n))))
-    701                      (fn [view n] #?(:clj (Double/parseDouble (binf/rr-string view n))
-                                             :cljs (js/parseFloat (binf/rr-string view n))))
+    26                       integer
+    700                      #?(:clj (fn [b off n] (Float/parseFloat (text b off n)))
+                                :cljs float8)
+    701                      float8
     ;; char(n) keeps the server's trailing-space padding, as pgJDBC and
     ;; node-postgres do. name is a catalog identifier.
-    (19 25 114 1042 1043 2950 3802)  binf/rr-string
+    (19 25 114 1042 1043 2950 3802)  text
     ;; Infinite dates are MAX and MIN on the JVM, as in pgJDBC, and
     ;; Infinity and -Infinity on Node, as in node-postgres.
     1082                     #?(:clj (infinite LocalDate/MAX LocalDate/MIN
@@ -168,16 +238,16 @@
                                 :cljs (infinite js/Infinity (- js/Infinity) #(js-date % true)))
     ;; JS has no time-of-day type, so Node gets time and timetz as strings,
     ;; as node-postgres does.
-    1083                     #?(:clj (fn [view n] (local-time (time-parts (binf/rr-string view n) 0 n (parts))))
-                                :cljs binf/rr-string)
-    1266                     #?(:clj (fn [view n]
-                                       (let [ps (time-parts (binf/rr-string view n) 0 n (parts))]
+    1083                     #?(:clj (fn [b off n] (local-time (time-parts (text b off n) 0 n (parts))))
+                                :cljs text)
+    1266                     #?(:clj (fn [b off n]
+                                       (let [ps (time-parts (text b off n) 0 n (parts))]
                                          (OffsetTime/of (local-time ps) (ZoneOffset/ofTotalSeconds (part ps 7)))))
-                                :cljs binf/rr-string)
+                                :cljs text)
     ;; numeric is arbitrary precision; JS has no type that holds it exactly.
-    1700                     (fn [view n] #?(:clj (bigdec (binf/rr-string view n))
-                                             :cljs (binf/rr-string view n)))
-    binf/rr-buffer))
+    1700                     #?(:clj (fn [b off n] (BigDecimal. (text b off n)))
+                                :cljs text)
+    raw))
 
 #?(:cljs
    (defn- local-timestamp

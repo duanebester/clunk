@@ -135,35 +135,100 @@
 (defn- decode-value
   "Reads one value of field's column with decode, or throws an error naming
    the column, its type OID and sql."
-  [decode view len field sql]
-  (try (decode view len)
+  [decode b off len field sql]
+  (try (decode b off len)
        (catch #?(:clj Exception :cljs :default) e
          (throw (ex-info (str "Could not decode column " (:field-name field) " (type " (:oid field) "): " (ex-message e))
                          {:column (:field-name field) :oid (:oid field) :sql sql}
                          e)))))
 
+(defn- map-builder
+  "The row builder for maps: from a RowDescription's column names, a
+   function that makes a row from an array of its values, a map keyed by
+   column name as a keyword. Up to 8 distinct keys go straight into an array
+   map, which is what assoc! would make of them; more, or the same name
+   twice, go through assoc! as ever."
+  [^objects names]
+  (let [n          (alength names)
+        ^objects ks (amap names i _ (keyword (aget names i)))]
+    (if (and (<= n 8) (= n (count (set ks))))
+      (let [^objects template (object-array (* 2 n))]
+        (dotimes [i n] (aset template (* 2 i) (aget ks i)))
+        (fn [^objects vals]
+          (let [kvs (aclone template)]
+            (dotimes [i n] (aset kvs (inc (* 2 i)) (aget vals i)))
+            #?(:clj (clojure.lang.PersistentArrayMap. kvs)
+               :cljs (PersistentArrayMap. nil n kvs nil)))))
+      (fn [^objects vals]
+        (loop [i 0 row (transient {})]
+          (if (< i n)
+            (recur (inc i) (assoc! row (aget ks i) (aget vals i)))
+            (persistent! row)))))))
+
+#?(:cljs
+   (defn- object-builder
+     "The row builder for clunk.node: rows are plain JS objects keyed by
+      column name, as JavaScript callers get them, with no map in between."
+     [names]
+     (let [n (alength names)]
+       (fn [vals]
+         (let [o #js {}]
+           (dotimes [i n] (unchecked-set o (aget names i) (aget vals i)))
+           o)))))
+
+#?(:cljs
+   (defn- buffer-of
+     "A function from a DataView to a Node Buffer over its whole ArrayBuffer,
+      which the value decoders read. One Buffer serves every row of a socket
+      read, since a read's messages are views into the same ArrayBuffer."
+     []
+     (let [last-ab (volatile! nil)
+           last-b  (volatile! nil)]
+       (fn [^js view]
+         (let [ab (.-buffer view)]
+           (if (identical? ab @last-ab)
+             @last-b
+             (do (vreset! last-ab ab)
+                 (vreset! last-b (js/Buffer.from ab)))))))))
+
 (defn- row-decoder
   "From a RowDescription's fields, a function that reads a DataRow's view
-   straight into a row map, or into an error if a value fails to decode. Keys
-   and per-column decoders are built once here, not once per row."
-  [fields sql]
+   straight into a row, made by a row builder (a map, or in ClojureScript
+   with js? a JS object), or into an error if a value fails to decode. Keys
+   and per-column decoders are built once here, not once per row. The
+   values are decoded into one array that every row reuses, since each row
+   is built before the next is read."
+  [fields sql js?]
   (let [fs       (object-array fields)
-        ks       (object-array (map (comp keyword :field-name) fields))
         decoders (object-array (map (comp oid-types/decoder :oid) fields))
-        n        (count fields)]
+        n        (count fields)
+        vals     (object-array n)
+        names    (object-array (map :field-name fields))
+        build    (#?(:clj map-builder :cljs (if js? object-builder map-builder)) names)
+        bytes-of #?(:clj nil :cljs (buffer-of))]
     (fn [view]
-      (binf/rr-i16 view) ;; column count, same as the RowDescription's
-      (try
-        (loop [i 0
-               row (transient {})]
-          (if (< i n)
-            (let [len (binf/rr-i32 view)] ;; -1 is SQL NULL
-              (recur (inc i)
-                     (assoc! row (aget ks i)
-                             (when (<= 0 len) (decode-value (aget decoders i) view len (aget fs i) sql)))))
-            (persistent! row)))
-        (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
-          e)))))
+      ;; Values are read from the view's own bytes, at absolute indexes:
+      ;; base is where the view starts in b, and p where in the view the
+      ;; next column starts, past the column count.
+      (let [#?@(:clj  [^java.nio.ByteBuffer bb view
+                       b    (.array bb)
+                       base (.arrayOffset bb)
+                       p    (+ 2 (.position bb))]
+                :cljs [^js dv view
+                       b    (bytes-of dv)
+                       base (.-byteOffset dv)
+                       p    (+ 2 (binf/position dv))])]
+        (try
+          (loop [i 0
+                 p p]
+            (if (< i n)
+              (let [len #?(:clj (.getInt bb (int p)) :cljs (.getInt32 dv p)) ;; -1 is SQL NULL
+                    p   (+ p 4)]
+                (aset vals i (when (<= 0 len) (decode-value (aget decoders i) b (+ base p) len (aget fs i) sql)))
+                (recur (inc i) (if (< 0 len) (+ p len) p)))
+              (build vals)))
+          (catch #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) e
+            e))))))
 
 (defn- start!
   "Sends request, which now has the connection. A query with params or a
@@ -231,7 +296,7 @@
   [{:keys [message-socket query] :as client} message]
   (when-let [^Query q @query]
     (if (= :RowDescription (:type message))
-      (vreset! (.-decode q) (row-decoder (:values message) (.-sql q)))
+      (vreset! (.-decode q) (row-decoder (:values message) (.-sql q) (:js-rows? (.-request q))))
       ;; Any other message ends a run of rows, so they go to the reader first.
       (let [sink   (.-sink q)
             live?  (and @(.-live q) (not (cancelled? (.-cancel q))) (-flush! sink message-socket))
@@ -482,12 +547,16 @@
    current socket read. With :cancel, the server sends rows in batches of
    :fetch-size (1000 unless given), so cancelling also stops the server
    after the current batch. Such a query, like one with parameters, is one
-   statement."
+   statement.
+
+   In ClojureScript, :js-rows? true makes each row a plain JS object keyed
+   by column name instead of a map, as clunk.node hands rows to JavaScript."
   ([client sql sink] (query client sql sink nil))
-  ([client sql sink {:keys [cancel fetch-size]}]
+  ([client sql sink {:keys [cancel fetch-size js-rows?]}]
    (submit client (request sql {:fetch-size (or fetch-size (if cancel default-fetch-size 0))
                                 :sink       sink
-                                :cancel     cancel}))
+                                :cancel     cancel
+                                :js-rows?   js-rows?}))
    nil))
 
 (defn execute
