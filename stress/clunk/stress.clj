@@ -5,15 +5,17 @@
      clojure -M:stress [seconds 180] [workers 2000]
 
    Each worker is a virtual thread that runs one query after another, of a
-   random kind (execute, plan read whole or left early, SQL errors, and
-   query with a promise-chan or timeout :cancel; simple or with parameters;
-   plain or in portal batches), and checks its rows or its error. A hang shows
+   random kind (execute, execute with a cancel token fired after a random
+   delay, plan read whole or left early, SQL errors, and clunk.async/query
+   with a promise-chan or timeout :cancel; simple or with parameters; plain
+   or in portal batches), and checks its rows or its error. A hang shows
    as an op still in flight hang-ms after the run stops. Meanwhile one admin client
    kills pool backends with pg_terminate_backend, idle and busy in turn, and
    another counts them in pg_stat_activity. A watch on the pool's state
    checks its invariants on every change. It exits 1 if anything failed."
   (:require [clojure.core.async :as async]
             [clojure.pprint :refer [pprint]]
+            [clunk.async :as ca]
             [clunk.core :as clunk]
             [clunk.pool :as pool])
   (:import (java.io File)
@@ -125,6 +127,19 @@
                     :ok
                     {:fail (str "wrong row " (pr-str r))})))
 
+      :execute-cancel
+      ;; Fired after 1 ms to 3 s, so some fire while the query waits for a
+      ;; connection, some while its rows arrive, and some after it's done.
+      (let [token  (clunk/cancel-token)
+            result (clunk/execute p (series-sql a b) (assoc (fetch-opts) :cancel token))]
+        (Thread/sleep (long (Math/pow 10 (rand 3.5))))
+        (clunk/cancel! token)
+        (try (if (= @result (rows a b)) :ok {:fail "wrong rows"})
+             (catch ExecutionException e
+               (cond (:cancelled (ex-data (ex-cause e))) :cancelled
+                     (killed? e)                         :killed
+                     :else                               {:fail (str "threw " (code-of e) " " (ex-message e))}))))
+
       :execute-error
       (let [[sql code] (if (< (rand) 0.5) ["SELECT * FROM no_such_table" "42P01"] [(error-sql a b) "22012"])]
         (expect-error code #(deref (clunk/execute p sql)) (constantly true)))
@@ -150,7 +165,7 @@
 
       :cancel-promise
       (let [cancel (async/promise-chan)
-            ch     (clunk/query p (series-sql a b) (assoc (fetch-opts) :cancel cancel))
+            ch     (ca/query p (series-sql a b) (assoc (fetch-opts) :cancel cancel))
             m      (rand-int 100)
             head   (take-rows ch m)]
         (async/close! cancel)
@@ -164,14 +179,14 @@
       :cancel-timeout
       ;; 1 ms to 20 s, so some fire while the query waits for a connection
       ;; and some while its rows arrive.
-      (let [got (take-rows (clunk/query p (series-sql a b) (assoc (fetch-opts) :cancel (async/timeout (int (Math/pow 10 (rand 4.3)))))) ##Inf)]
+      (let [got (take-rows (ca/query p (series-sql a b) (assoc (fetch-opts) :cancel (async/timeout (int (Math/pow 10 (rand 4.3)))))) ##Inf)]
         (cond (some clunk/error? got)   (if (every? #(or (not (clunk/error? %)) (killed? %)) got) :killed {:fail "error"})
               (empty? got)              :cancelled-early
               (= got (rows a b))        :ok
               (in-order? got a b)       :cancelled-mid
               :else                     {:fail "wrong rows"})))))
 
-(def kinds [:execute :execute :execute-params :execute-error :plan :plan :plan-early :plan-error :cancel-promise :cancel-timeout :cancel-timeout])
+(def kinds [:execute :execute :execute-params :execute-cancel :execute-error :plan :plan :plan-early :plan-error :cancel-promise :cancel-timeout :cancel-timeout])
 
 ;; ---- measuring
 
@@ -209,7 +224,7 @@
 
 (defn- admin-client []
   (let [c (clunk/client config)]
-    (async/<!! (clunk/connect c))
+    @(clunk/connect c)
     c))
 
 (defn- pid-of [c] (:pid (first @(clunk/execute c "SELECT pg_backend_pid() AS pid"))))

@@ -29,6 +29,15 @@
     #?(:clj (async/<!! result)
        :cljs (t/async done (async/take! result (fn [_] (done)))))))
 
+(defn- settle
+  "A channel that yields [:ok value] or [:error e] once execute's future or
+   promise settles."
+  [p]
+  (let [ch (async/promise-chan)]
+    #?(:clj  (.whenComplete ^CompletableFuture p (fn [v e] (async/put! ch (if e [:error e] [:ok v]))))
+       :cljs (.then p #(async/put! ch [:ok %]) #(async/put! ch [:error %])))
+    ch))
+
 (defn- connect!
   "A channel that yields a connected client, or the error that stopped it:
    on the JVM, client throws it while it connects; on Node, connect yields it."
@@ -38,7 +47,7 @@
                          :cljs (async/to-chan! [(clunk/client cfg)])))]
       (if (instance? #?(:clj Throwable :cljs js/Error) c)
         c
-        (let [ready (async/<! (clunk/connect c))]
+        (let [[_ ready] (async/<! (settle (clunk/connect c)))]
           (if (clunk/error? ready)
             (do (clunk/close c) ready)
             c))))))
@@ -49,20 +58,16 @@
 (defn- message [x]
   (when (failed? x) (ex-message x)))
 
+(defn- exec
+  "A channel that yields execute's rows, or its error."
+  ([c sql] (exec c sql nil))
+  ([c sql opts] (async/go (second (async/<! (settle (clunk/execute c sql opts)))))))
+
 (defn- tls?
   "Inside a go block: whether the client's connection is encrypted, as the
    server sees it."
   [c]
-  (async/go (:ssl (first (clunk/<query! c "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")))))
-
-(defn- settle
-  "A channel that yields [:ok value] or [:error e] once execute's future or
-   promise settles."
-  [p]
-  (let [ch (async/promise-chan)]
-    #?(:clj  (.whenComplete ^CompletableFuture p (fn [v e] (async/put! ch (if e [:error e] [:ok v]))))
-       :cljs (.then p #(async/put! ch [:ok %]) #(async/put! ch [:error %])))
-    ch))
+  (async/go (:ssl (first (async/<! (exec c "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()"))))))
 
 (defn- fake-server
   "Listens on a free port and answers each connection's SSLRequest with
@@ -121,23 +126,20 @@
            (t/is (not (failed? c)) (message c))
            (t/is (true? (async/<! (tls? c))))
            ;; About 2.4 MB: many TLS records, with messages cut across them.
-           (let [rows (clunk/<query! c "SELECT g::int4 AS n, repeat('x', 100)::varchar AS s FROM generate_series(1, 20000) g")]
+           (let [rows (async/<! (exec c "SELECT g::int4 AS n, repeat('x', 100)::varchar AS s FROM generate_series(1, 20000) g"))]
              (t/is (= 20000 (count rows)))
              (t/is (= (range 1 20001) (map :n rows))))
-           (t/is (= [{:n 42 :s "Zürich"}] (clunk/<query! c ["SELECT $1::int4 AS n, $2::text AS s" 42 "Zürich"])))
+           (t/is (= [{:n 42 :s "Zürich"}] (async/<! (exec c ["SELECT $1::int4 AS n, $2::text AS s" 42 "Zürich"]))))
            ;; A portal that fails in its fifth batch of 100.
-           (let [rows (async/<! (async/into [] (clunk/query c "SELECT (1 / (450 - g))::int4 AS x FROM generate_series(1, 1000) g"
-                                                            {:cancel (async/promise-chan) :fetch-size 100})))]
-             (t/is (= 449 (count (butlast rows))))
-             (t/is (= "22012" (:code (ex-data (last rows))))))
+           (t/is (= "22012" (:code (ex-data (async/<! (exec c "SELECT (1 / (450 - g))::int4 AS x FROM generate_series(1, 1000) g"
+                                                            {:fetch-size 100}))))))
            ;; Cancelling stops the server after the first batch of 1000 rows.
-           (clunk/<query! c "CREATE TEMP SEQUENCE tls_rows")
-           (let [cancel (async/promise-chan)
-                 ch     (clunk/query c "SELECT nextval('tls_rows')::int4 AS n FROM generate_series(1, 100000)" {:cancel cancel})]
-             (t/is (= {:n 1} (async/<! ch)))
-             (async/<! (async/timeout 200))
-             (async/close! cancel)
-             (t/is (= [{:n 1000}] (clunk/<query! c "SELECT last_value::int4 AS n FROM tls_rows"))))
+           (async/<! (exec c "CREATE TEMP SEQUENCE tls_rows"))
+           (let [token  (clunk/cancel-token)
+                 result (exec c "SELECT nextval('tls_rows')::int4 AS n FROM generate_series(1, 100000)" {:cancel token})]
+             (clunk/cancel! token)
+             (t/is (= {:cancelled true} (ex-data (async/<! result))))
+             (t/is (= [{:n 1000}] (async/<! (exec c "SELECT last_value::int4 AS n FROM tls_rows")))))
            (t/is (= [:ok [{:n 7}]] (async/<! (settle (clunk/execute c "SELECT 7::int4 AS n")))))
            (clunk/close c)))))
 
@@ -145,25 +147,25 @@
   (run (async/go
          (let [p (pool/pool (assoc config :max-size 2))]
            ;; Two at a time, four half-second queries take 1 s.
-           (let [chs  (doall (repeatedly 4 #(async/into [] (clunk/query p "SELECT ssl, pg_backend_pid() AS pid FROM pg_stat_ssl, pg_sleep(0.5) WHERE pid = pg_backend_pid()"))))
+           (let [chs  (doall (repeatedly 4 #(exec p "SELECT ssl, pg_backend_pid() AS pid FROM pg_stat_ssl, pg_sleep(0.5) WHERE pid = pg_backend_pid()")))
                  rows (loop [[ch & more] chs acc []] (if ch (recur more (into acc (async/<! ch))) acc))]
              (t/is (= 4 (count rows)))
              (t/is (every? :ssl rows))
              (t/is (= 2 (count (set (map :pid rows))))))
-           ;; Leaving a stream between portal batches gives its connection back.
-           (let [cancel (async/promise-chan)
-                 rows   (clunk/query p ["SELECT generate_series(1, $1)::int4 AS n" 5000] {:cancel cancel :fetch-size 10})]
-             (t/is (= {:n 1} (async/<! rows)))
-             (async/close! cancel)
+           ;; Cancelling between portal batches gives the connection back.
+           (let [token  (clunk/cancel-token)
+                 result (exec p ["SELECT generate_series(1, $1)::int4 AS n" 5000] {:cancel token :fetch-size 10})]
+             (clunk/cancel! token)
+             (t/is (= {:cancelled true} (ex-data (async/<! result))))
              (t/is (= [:ok [{:n 2}]] (async/<! (settle (clunk/execute p "SELECT 2::int4 AS n"))))))
            ;; A TLS connection the server drops, during its own query, is replaced.
-           (let [rows (clunk/<query! p "SELECT pg_terminate_backend(pg_backend_pid())")]
-             (t/is (some clunk/error? rows))
-             (t/is (= [true] (map :ssl (clunk/<query! p "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")))))
+           (let [rows (async/<! (exec p "SELECT pg_terminate_backend(pg_backend_pid())"))]
+             (t/is (clunk/error? rows))
+             (t/is (= [true] (map :ssl (async/<! (exec p "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()"))))))
            (clunk/close p))
          ;; A failed handshake fails the query, and execute, that needed the connection.
          (let [p (pool/pool (assoc config :ssl-root-cert (str certs "other-ca.crt")))]
-           (t/is (re-find #"TLS handshake failed" (str (message (first (clunk/<query! p "SELECT 1"))))))
+           (t/is (re-find #"TLS handshake failed" (str (message (async/<! (exec p "SELECT 1"))))))
            (let [[status err] (async/<! (settle (clunk/execute p "SELECT 1")))]
              (t/is (= :error status))
              (t/is (re-find #"TLS handshake failed" (str (message err)))))
@@ -202,7 +204,7 @@
              (t/is (= (str "The server does not support TLS, which :ssl " mode " needs")
                       (some->> (async/<! (connect! (assoc via :ssl mode))) message (re-find #"The server does not.*"))))
              (let [p (pool/pool (assoc via :ssl mode))]
-               (t/is (re-find #"does not support TLS" (str (message (first (clunk/<query! p "SELECT 1"))))))
+               (t/is (re-find #"does not support TLS" (str (message (async/<! (exec p "SELECT 1"))))))
                (clunk/close p)))
            (close))
          ;; Bytes after S arrive before TLS starts, so anyone could have sent them.
@@ -218,12 +220,12 @@
                                   ;; PEM text works in place of a file name.
                                   :ssl-root-cert #?(:clj (slurp (str certs "ca.crt")) :cljs (str (fs/readFileSync (str certs "ca.crt")))))
                c (async/<! (connect! (assoc cert-config :ssl-cert (str certs "client.crt") :ssl-key (str certs "client.key"))))]
-           (t/is (= [{:u "clunk_cert"}] (clunk/<query! c "SELECT current_user AS u")))
+           (t/is (= [{:u "clunk_cert"}] (async/<! (exec c "SELECT current_user AS u"))))
            (clunk/close c)
            (t/is (re-find #"certificate" (str (message (async/<! (connect! cert-config)))))))
          ;; Direct negotiation needs Postgres 17.
          (let [c       (async/<! (connect! plain-config))
-               version (:v (first (clunk/<query! c "SELECT current_setting('server_version_num')::int4 AS v")))]
+               version (:v (first (async/<! (exec c "SELECT current_setting('server_version_num')::int4 AS v"))))]
            (clunk/close c)
            (when (<= 170000 version)
              (let [d (async/<! (connect! (assoc config :ssl-negotiation :direct)))]

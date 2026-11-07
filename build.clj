@@ -23,7 +23,13 @@
 
 (defn jar [opts]
   (clean opts)
-  (let [basis   (b/create-basis {:project "deps.edn"})
+  (let [;; clunk.async needs core.async, which the pom lists as optional, so
+        ;; Maven and tools.deps leave it out unless a user adds it. The
+        ;; version is the one the test alias uses.
+        async   (get-in (b/create-basis {:project "deps.edn" :aliases [:test]}) [:libs 'org.clojure/core.async])
+        basis   (-> (b/create-basis {:project "deps.edn"
+                                     :extra   {:deps {'org.clojure/core.async (select-keys async [:mvn/version])}}})
+                    (assoc-in [:libs 'org.clojure/core.async :optional] true))
         version (version opts)]
     (b/write-pom {:class-dir class-dir
                   :lib       lib

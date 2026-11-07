@@ -22,11 +22,6 @@
     {:type   :ParameterStatus
      :param param :status status}))
 
-(defn print-ints
-  "Prints byte array as ints"
-  [ba]
-  (println (map (partial int) ba)))
-
 (defn handle-data-row
   "Leaves the columns undecoded: the query that asked for them knows their
    types, and decodes them straight from the view (see clunk.core)."

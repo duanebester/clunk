@@ -4,8 +4,6 @@
             [clunk.framing :as framing]
             [clunk.byte-buffer-socket :as bs]))
 
-#?(:cljs (enable-console-print!))
-
 (defrecord MessageSocket [buffer-socket paused? drain])
 
 (defn connected?

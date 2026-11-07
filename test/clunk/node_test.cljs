@@ -116,3 +116,20 @@
           (t/is (instance? js/Error err))
           (t/is (re-find #"TLS handshake failed.*127\.0\.0\.1" (.-message err)))))
       (done))))
+
+(t/deftest listen-is-an-async-iterable-that-break-unlistens
+  (t/async done
+    (async/go
+      (let [c  (<p! (node/connect config))
+            it (node/listen c "clunk_node")]
+        (<p! (node/query c "SELECT 1")) ;; queued after LISTEN, so it has run
+        (<p! (node/notify c "clunk_node" "hi 🐘"))
+        (let [n (js->clj (.-value (<p! (.next it))))]
+          (t/is (= {"channel" "clunk_node" "payload" "hi 🐘"} (dissoc n "pid")))
+          (t/is (number? (get n "pid"))))
+        ;; What for-await does on break: UNLISTEN goes, and the iterator is done.
+        (<p! (.return it))
+        (t/is (true? (.-done (<p! (.next it)))))
+        (t/is (= [] (js->clj (<p! (node/query c "SELECT pg_listening_channels() AS c")))))
+        (node/close c))
+      (done))))

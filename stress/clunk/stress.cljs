@@ -7,7 +7,8 @@
 
    Each worker is a go loop that runs one query after another through the
    JavaScript API (query, stream, stream left early as break does, SQL
-   errors) or clunk.core/query with a promise-chan or timeout :cancel, simple
+   errors), clunk.core/execute with a cancel token fired after a random
+   delay, or clunk.async/query with a promise-chan or timeout :cancel, simple
    or with parameters, plain or in portal batches, and checks its rows or its
    error. A hang shows as an op still in flight hang-ms after the run stops.
    Meanwhile one admin client kills pool backends with pg_terminate_backend,
@@ -16,6 +17,7 @@
    anything failed."
   (:require [cljs.core.async :as async]
             [cljs.pprint :refer [pprint]]
+            [clunk.async :as ca :refer [<query!]]
             [clunk.core :as clunk]
             [clunk.node :as node]))
 
@@ -51,7 +53,7 @@
   [sql (some-> params clj->js)])
 
 (defn- clj-sql
-  "The sql argument of clunk.core/query."
+  "The sql argument of clunk.core/execute and clunk.async/query."
   [[sql params]]
   (if params (into [sql] params) sql))
 
@@ -173,9 +175,22 @@
             (error-result err "22012" #(exactly? rows a (dec b)))
             {:fail "no error"}))
 
+        :execute-cancel
+        ;; Fired after 1 ms to 3 s, so some fire while the query waits for a
+        ;; connection, some while its rows arrive, and some after it's done.
+        (let [token   (clunk/cancel-token)
+              result  (clunk/execute p (clj-sql (series a b)) (assoc (fetch-opts) :cancel token))
+              _       (async/<! (async/timeout (js/Math.pow 10 (rand 3.5))))
+              _       (clunk/cancel! token)
+              [tag v] (async/<! (settle result))]
+          (cond (= :ok tag)                 (if (exactly? v a b) :ok {:fail "wrong rows"})
+                (:cancelled (ex-data v))    :cancelled
+                (killed? v)                 :killed
+                :else                       {:fail (str "rejected " (ex-message v))}))
+
         :cancel-promise
         (let [cancel (async/promise-chan)
-              ch     (clunk/query p (clj-sql (series a b)) (assoc (fetch-opts) :cancel cancel))
+              ch     (ca/query p (clj-sql (series a b)) (assoc (fetch-opts) :cancel cancel))
               head   (async/<! (take-chan ch (rand-int 100)))]
           (async/close! cancel)
           (let [tail (async/<! (take-chan ch js/Infinity))]
@@ -187,12 +202,12 @@
         :cancel-timeout
         ;; 1 ms to 20 s, so some fire while the query waits for a connection
         ;; and some while its rows arrive.
-        (chan-result (async/<! (take-chan (clunk/query p (clj-sql (series a b))
+        (chan-result (async/<! (take-chan (ca/query p (clj-sql (series a b))
                                                        (assoc (fetch-opts) :cancel (async/timeout (int (js/Math.pow 10 (rand 4.3))))))
                                           js/Infinity))
                      a b)))))
 
-(def kinds [:query :query :query-params :query-error :stream :stream :stream-break :stream-error :cancel-promise :cancel-timeout :cancel-timeout])
+(def kinds [:query :query :query-params :query-error :stream :stream :stream-break :stream-error :execute-cancel :cancel-promise :cancel-timeout :cancel-timeout])
 
 ;; ---- measuring
 
@@ -208,7 +223,7 @@
 (defn- admin-client []
   (async/go
     (let [c (clunk/client config)]
-      (async/<! (clunk/connect c))
+      (async/<! (ca/connect c))
       c)))
 
 (defn- invariant-errors [{:keys [idle size waiters closed?]}]
@@ -222,7 +237,7 @@
 
 (defn- backends [admin admin-pids]
   (async/go
-    (:n (first (clunk/<query! admin (str "SELECT count(*)::int4 AS n FROM pg_stat_activity"
+    (:n (first (<query! admin (str "SELECT count(*)::int4 AS n FROM pg_stat_activity"
                                          " WHERE usename = 'jimmy' AND datname = 'world'"
                                          " AND backend_type = 'client backend'"
                                          " AND pid NOT IN (" (apply str (interpose ", " admin-pids)) ")"))))))
@@ -234,8 +249,8 @@
     (async/go
       (let [killer     (async/<! (admin-client))
             watcher    (async/<! (admin-client))
-            admins     [(:pid (first (clunk/<query! killer "SELECT pg_backend_pid() AS pid")))
-                        (:pid (first (clunk/<query! watcher "SELECT pg_backend_pid() AS pid")))]
+            admins     [(:pid (first (<query! killer "SELECT pg_backend_pid() AS pid")))
+                        (:pid (first (<query! watcher "SELECT pg_backend_pid() AS pid")))]
             base       {:heap-mb (heap-mb) :rss-mb (rss-mb) :sockets (sockets)}
             p          (node/pool (clj->js (assoc config :maxSize max-size)))
             state      (:state p)
@@ -270,13 +285,13 @@
             kill-loop  (async/go-loop [want "idle"]
                          (when-not @stop?
                            (async/<! (async/timeout (+ 300 (rand-int 700))))
-                           (let [pids (map :pid (clunk/<query! killer (str "SELECT pid FROM pg_stat_activity"
+                           (let [pids (map :pid (<query! killer (str "SELECT pid FROM pg_stat_activity"
                                                                            " WHERE usename = 'jimmy' AND datname = 'world'"
                                                                            " AND backend_type = 'client backend'"
                                                                            " AND state = '" want "'"
                                                                            " AND pid NOT IN (" (apply str (interpose ", " admins)) ")")))]
                              (when-let [pid (first (shuffle pids))]
-                               (clunk/<query! killer (str "SELECT pg_terminate_backend(" pid ")"))
+                               (<query! killer (str "SELECT pg_terminate_backend(" pid ")"))
                                (swap! kills update (keyword want) inc)))
                            (recur (if (= want "idle") "active" "idle"))))
             watch-loop (async/go-loop [i 0]

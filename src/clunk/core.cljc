@@ -1,26 +1,21 @@
 (ns clunk.core
-  (:require [clojure.core.async :as async]
-            [clojure.string :as str]
-            #?(:clj  [clojure.core.async.impl.protocols :as async-impl]
-               :cljs [cljs.core.async.impl.protocols :as async-impl])
+  (:require [clojure.string :as str]
+            [clunk.log :as log]
             [clunk.pw :as pw]
             [clunk.oid-types :as oid-types]
             [clunk.vendor.binf :as binf]
             [clunk.message-socket :as ms])
-  #?(:clj (:import (java.util.concurrent CompletableFuture)
-                   (java.util.function Function)))
-  #?(:cljs (:require-macros [clunk.core])))
+  #?(:clj (:import (java.util.concurrent ArrayBlockingQueue CompletableFuture LinkedBlockingQueue)
+                   (java.util.function Function))))
 
 (defprotocol Queryable
   "What query, execute and plan run sql on: a Client, or a pool of clients
    (clunk.pool)."
   (submit [this request]
     "Queues request, a map with :sql, :params, :fetch-size, :sink (where its
-     rows go; see Sink), :cancel (the caller's cancel channel, or nil) and
-     :cancelled (an atom that turns true once query's watcher has seen cancel
-     fire), to run on a connection. Ends the sink at once if it can't. A
-     request's optional :done function is called once the query has finished
-     on its connection.")
+     rows go; see Sink) and :cancel (see Cancel, or nil), to run on a
+     connection. Ends the sink at once if it can't. A request's optional
+     :done function is called once the query has finished on its connection.")
   (close [this]
     "Closes the connection, or every connection of a pool.")
   (listener [this]
@@ -35,13 +30,43 @@
      :cljs (f)))
 
 (defprotocol Sink
-  "Where a query's rows go. The connection calls these in order, on the JVM
-   from its reader thread, and ends every sink exactly once. Each returns
-   false once the reader has gone, so the connection can stop the server."
+  "Where a query's rows go; see query. The connection calls these in order,
+   on the JVM from its reader thread, and ends every sink exactly once. Each
+   returns false once the reader has gone, so the connection can stop the
+   server. They may block on the JVM, which pushes back on the server. In
+   JS they can't, so a sink pushes back by calling clunk.message-socket's
+   pause on ms, and resume once it has room again."
   (-row! [sink ms row] "ms is the message socket the query runs on, or nil.")
   (-flush! [sink ms] "Hands over rows held back so far.")
   (-error! [sink ms err])
   (-end! [sink ms]))
+
+(defprotocol Cancel
+  "What a query's :cancel takes: a token from cancel-token, or anything else
+   that can say whether it has fired. The connection asks before a pooled
+   query starts, and after each socket read and batch while it runs, never
+   once per row."
+  (cancelled? [token] "True once token has fired."))
+
+(extend-protocol Cancel
+  nil
+  (cancelled? [_] false))
+
+(deftype CancelToken [fired]
+  Cancel
+  (cancelled? [_] @fired))
+
+(defn cancel-token
+  "A token to pass as a query's :cancel, and to fire with cancel!."
+  []
+  (CancelToken. (volatile! false)))
+
+(defn cancel!
+  "Fires token: a query given it that still waits for a pool's connection
+   never runs, and a running one stops after the current batch."
+  [^CancelToken token]
+  (vreset! (.-fired token) true)
+  nil)
 
 (def ^:private empty-queue #?(:clj clojure.lang.PersistentQueue/EMPTY :cljs cljs.core/PersistentQueue.EMPTY))
 
@@ -49,7 +74,8 @@
   (ex-info msg data))
 
 (defn error?
-  "True for the error values connect and query put on their channels."
+  "True for the error values clunk hands over in place of a row or a
+   notification, and fails futures and promises with."
   [x]
   (instance? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo) x))
 
@@ -60,13 +86,26 @@
   (-end! sink nil)
   (when done (done)))
 
-(defn cancelled?
-  "True once request's :cancel has fired: closed, or holding a value. Taking
-   that value means query's watcher never sees it, so the caller must end the
-   request itself."
-  [{:keys [cancel cancelled]}]
-  (or @cancelled
-      (and cancel (or (async-impl/closed? cancel) (some? (async/poll! cancel))))))
+(defn- deferred
+  "What connect returns: a CompletableFuture on the JVM, and in JS a map of
+   a js/Promise and the functions that settle it. The promise's rejection is
+   handled here, so a client nobody connects doesn't crash Node with an
+   unhandled one."
+  []
+  #?(:clj  (CompletableFuture.)
+     :cljs (let [fns (volatile! nil)
+                 p   (js/Promise. (fn [ok fail] (vreset! fns [ok fail])))]
+             (.catch p (fn [_]))
+             {:promise p :ok (first @fns) :fail (second @fns)})))
+
+(defn- settle!
+  "Completes deferred d with x, or fails it if x is an error. Only the first
+   call counts."
+  [d x]
+  #?(:clj  (if (error? x)
+             (.completeExceptionally ^CompletableFuture d x)
+             (.complete ^CompletableFuture d x))
+     :cljs ((if (error? x) (:fail d) (:ok d)) x)))
 
 ;; ---- the connection's protocol state machine
 ;;
@@ -87,10 +126,11 @@
 ;; The running query. live, synced and decode are volatiles, read and set on
 ;; every message, which is why this is a type and not a map: a DataRow costs
 ;; field reads, not keyword lookups.
-;;   live    false once the sink refuses rows; the rest are read and dropped
+;;   live    false once the sink refuses rows or cancel fires; the rest are
+;;           read and dropped
 ;;   synced  true once Sync is sent; the server then ends with ReadyForQuery
 ;;   decode  the row decoder from the last RowDescription
-(deftype Query [request sink sql fetch msock live synced decode])
+(deftype Query [request sink sql fetch cancel msock live synced decode])
 
 (defn- decode-value
   "Reads one value of field's column with decode, or throws an error naming
@@ -131,9 +171,9 @@
    Execute asks for that many rows, and the next batch is asked for only while
    the sink wants more, so a reader that leaves also stops the server.
    Otherwise sql goes as a simple Query, which can hold several statements."
-  [{:keys [message-socket query state]} {:keys [sql params fetch-size sink] :as request}]
+  [{:keys [message-socket query state]} {:keys [sql params fetch-size sink cancel] :as request}]
   (let [batched? (pos? fetch-size)
-        q        (Query. request sink sql fetch-size message-socket
+        q        (Query. request sink sql fetch-size cancel message-socket
                          (volatile! true) (volatile! (not batched?)) (volatile! nil))]
     (reset! query q)
     ;; The connection may have ended after this request took it and before
@@ -194,7 +234,7 @@
       (vreset! (.-decode q) (row-decoder (:values message) (.-sql q)))
       ;; Any other message ends a run of rows, so they go to the reader first.
       (let [sink   (.-sink q)
-            live?  (and @(.-live q) (-flush! sink message-socket))
+            live?  (and @(.-live q) (not (cancelled? (.-cancel q))) (-flush! sink message-socket))
             synced (.-synced q)]
         (vreset! (.-live q) live?)
         (case (:type message)
@@ -217,16 +257,15 @@
   "Authentication failed: connect yields err, and so does every query."
   [{:keys [state ready]} err]
   (let [[old] (swap-vals! state assoc :phase :failed :failure (constantly err) :queue empty-queue)]
-    (async/put! @ready err)
+    (settle! ready err)
     (run! #(fail! % err) (:queue old))))
 
 (defn- on-startup-message
   "Answers the server's auth requests until it is ready for queries."
   [{:keys [message-socket config state ready scram] :as client} message]
-  (let [{:keys [user password debug]} config
+  (let [{:keys [user password]} config
         send #(ms/send! message-socket %)]
-    (when debug
-      (println message))
+    (log/debug "Startup message" message)
     (try
       (case (:type message)
         :ReadyForQuery
@@ -234,7 +273,7 @@
                                         (if (seq queue)
                                           (assoc s :phase :ready :busy? true :queue (pop queue))
                                           (assoc s :phase :ready :busy? false))))]
-          (async/put! @ready message)
+          (settle! ready message)
           (when-let [next (peek (:queue old))]
             (start! client next)))
 
@@ -283,7 +322,7 @@
    rather than waiting for a batch to fill."
   [{:keys [query message-socket]}]
   (when-let [^Query q @query]
-    (when (and @(.-live q) (not (-flush! (.-sink q) message-socket)))
+    (when (and @(.-live q) (or (cancelled? (.-cancel q)) (not (-flush! (.-sink q) message-socket))))
       (vreset! (.-live q) false))))
 
 (defn- on-close
@@ -296,8 +335,8 @@
                                      (#{:new :startup :ready} phase) (assoc :phase :failed :failure closed))))
         cause  (ms/closed-by (:message-socket client))
         err    (ex-info (str "Connection closed during startup" (some->> cause ex-message (str ": "))) {} cause)]
-    ;; A no-op if connect already yielded.
-    (async/put! @(:ready client) err)
+    ;; A no-op if connect already settled.
+    (settle! (:ready client) err)
     (when (#{:new :startup} (:phase old))
       (run! #(fail! % err) (:queue old)))
     ;; A swap, as start! may race to end the query it just set; see start!.
@@ -371,13 +410,12 @@
         user     (get config :username "postgres")
         password (get config :password "")
         database (get config :database "postgres")
-        debug    (get config :debug false)
-        cfg      {:debug debug :host host :port port :user user :password password :database database}
+        cfg      {:host host :port port :user user :password password :database database}
         c        (map->Client {:message-socket (ms/get-message-socket port host (ssl-config config host))
                                :config         cfg
                                :state          (atom {:phase :new :busy? false :queue empty-queue})
                                :query          (atom nil)
-                               :ready          (volatile! (async/promise-chan))
+                               :ready          (deferred)
                                :scram          (volatile! nil)
                                ;; LISTEN channel name -> the listeners on it; see listen.
                                :listeners      (atom {})})]
@@ -386,116 +424,71 @@
 
 (defn connect
   "Starts the connection: authenticates, then serves queued queries one at a
-   time. Returns a channel that yields the server's ReadyForQuery message, or
-   an error, and then closes. Queries made before it is ready wait their turn."
-  [{:keys [state ready message-socket config] :as client}]
+   time. Returns the server's ReadyForQuery message as a CompletableFuture
+   on the JVM (deref it with @) and a js/Promise in ClojureScript, failed
+   with the error if connecting or authenticating fails. Queries made before
+   it is ready wait their turn. On the JVM the future completes on the
+   connection's reader thread; see execute."
+  [{:keys [state ready message-socket config]}]
   (let [[old] (swap-vals! state (fn [s] (cond-> s (= :new (:phase s)) (assoc :phase :startup))))]
     (case (:phase old)
       :new    (ms/send! message-socket {:type :StartupMessage :user (:user config) :database (:database config)})
-      :failed (async/put! @ready ((:failure old) {}))
+      :failed (settle! ready ((:failure old) {}))
       nil)
-    @ready))
+    #?(:clj ready :cljs (:promise ready))))
 
-;; ---- sinks
+;; ---- results
 
-(def ^:private batch-size
-  "Most rows a channel sink puts on its channel at once. The channel takes a
-   batch only once its reader has taken every row of the last one, so with
-   one more batch waiting, at most 64 rows are read ahead of the reader. That
-   keeps a query that stops early from asking the server for another
-   fetch-size batch."
-  32)
-
-(defn- put-rows!
-  "Puts a batch of rows on out, and returns false if out is closed. On the
-   JVM it blocks the reader thread until out takes it, which pushes back on
-   the server. In JS it can't block, so it pauses the socket until out takes
-   every batch put."
-  [ms pending out rows]
-  #?(:clj  (async/>!! out rows)
-     :cljs (let [state (volatile! :putting)
-                 open? (async/put! out rows (fn [_]
-                                              (if (= :putting @state)
-                                                (vreset! state :taken)
-                                                (when (zero? (vswap! pending dec))
-                                                  (some-> ms ms/resume)))))]
-             (when (= :putting @state)
-               (vreset! state :waiting)
-               (when (= 1 (vswap! pending inc))
-                 (some-> ms ms/pause)))
-             open?)))
-
-(deftype ChanSink [out pending ^:unsynchronized-mutable rows]
-  Sink
-  (-row! [this ms row]
-    (set! rows (conj! rows row))
-    (if (< (count rows) batch-size) true (-flush! this ms)))
-  (-flush! [_ ms]
-    (if (zero? (count rows))
-      (not (async-impl/closed? out))
-      (let [batch (persistent! rows)]
-        (set! rows (transient []))
-        (put-rows! ms pending out batch))))
-  (-error! [this ms err]
-    (and (-flush! this ms) (put-rows! ms pending out [err])))
-  (-end! [this ms]
-    (-flush! this ms)
-    (async/close! out)))
-
-(defn- chan-sink [out]
-  (ChanSink. out (volatile! 0) (transient [])))
-
-(deftype Collector [ok fail ^:unsynchronized-mutable rows ^:unsynchronized-mutable err]
+(deftype Collector [ok fail cancel ^:unsynchronized-mutable rows ^:unsynchronized-mutable err]
   Sink
   (-row! [_ _ row] (set! rows (conj! rows row)) true)
   (-flush! [_ _] true)
   (-error! [_ _ e] (when-not err (set! err e)) true)
-  (-end! [_ _] (if err (fail err) (ok (persistent! rows)))))
+  (-end! [_ _]
+    (cond err                 (fail err)
+          (cancelled? cancel) (fail (error "Query cancelled" {:cancelled true}))
+          :else               (ok (persistent! rows)))))
+
+(defn- collector
+  "A sink that calls ok with all the rows, or fail with the error, or with
+   an error once cancel has fired."
+  ([ok fail] (collector ok fail nil))
+  ([ok fail cancel] (Collector. ok fail cancel (transient []) nil)))
 
 (def ^:private default-fetch-size
-  "Rows per batch for a query that has a :cancel channel."
+  "Rows per batch for a query that has a :cancel, and for plan."
   1000)
 
 (defn- request [sql opts]
-  (merge {:sql       (if (string? sql) sql (first sql))
-          :params    (when-not (string? sql) (mapv oid-types/param-text (rest sql)))
-          :cancelled (atom false)}
+  (merge {:sql    (if (string? sql) sql (first sql))
+          :params (when-not (string? sql) (mapv oid-types/param-text (rest sql)))}
          opts))
 
 (defn query
-  "Queues a query on a client or a pool and returns a channel of row maps,
-   keyed by column name, that closes after the last row. A failed query puts
-   an error on the channel.
+  "Runs sql on a client or a pool and hands its rows to sink, a Sink, as
+   they arrive: -row! with each row map, keyed by column name; -flush! as
+   each run of rows ends; -error! with an error value if the query fails or
+   a value fails to decode; and -end!, once, last. A sink that returns false
+   gets nothing more, and the server stops. Returns nil. This is the
+   low-level API that execute, plan, clunk.async and clunk.node build on.
 
    sql is a string, or a vector of a statement and the values of its
    parameters $1, $2, ..., as in [\"SELECT * FROM city WHERE id = $1\" 42].
    A string with no parameters can hold several statements.
 
-   To stop early, pass a :cancel channel, such as a promise-chan or a timeout,
-   and close it or put on it: the returned channel closes and the client
-   discards the rest of the result. A query still waiting for a pool's
-   connection doesn't run at all. Closing the returned channel alone can
-   leave the client waiting to put a row, holding up every later query.
-
-   With :cancel, the server sends the rows in batches of :fetch-size (1000
-   unless given), so cancelling also stops the server after the current
-   batch. Such a query, like one with parameters, is one statement."
-  ([client sql] (query client sql nil))
-  ([client sql {:keys [cancel fetch-size]}]
-   (let [out (async/chan 1 cat) ;; takes batches of rows; see batch-size
-         req (request sql {:fetch-size (or fetch-size (if cancel default-fetch-size 0))
-                           :sink       (chan-sink out)
-                           :cancel     cancel})]
-     (when cancel
-       ;; A put already parked on out outlives close!, so take until out is
-       ;; empty; the next put is refused and the client stops sending rows.
-       (async/go
-         (async/<! cancel)
-         (reset! (:cancelled req) true)
-         (async/close! out)
-         (loop [] (when (async/<! out) (recur)))))
-     (submit client req)
-     out)))
+   To stop early, pass a :cancel token from cancel-token, and fire it with
+   cancel!: a query still waiting for a pool's connection doesn't run at all
+   (its sink just ends), and a running one hands over no more rows after the
+   current socket read. With :cancel, the server sends rows in batches of
+   :fetch-size (1000 unless given), so cancelling also stops the server
+   after the current batch. Such a query, like one with parameters, is one
+   statement."
+  ([client sql sink] (query client sql sink nil))
+  ([client sql sink {:keys [cancel fetch-size]}]
+   (submit client (request sql {:fetch-size (or fetch-size (if cancel default-fetch-size 0))
+                                :sink       sink
+                                :cancel     cancel}))
+   nil))
 
 (defn execute
   "Runs sql on a client or a pool, sql being a string or a vector of a
@@ -503,18 +496,53 @@
    vector of maps: a CompletableFuture on the JVM (deref it with @) and a
    js/Promise in ClojureScript. A failed query fails it with the error.
 
+   With a :cancel token, as for query, cancel! fails it with an error whose
+   ex-data has :cancelled true, and stops the server after the current
+   batch of :fetch-size rows.
+
    On the JVM the future completes on the connection's reader thread, so a
    function given to thenApply, whenComplete and the like runs there, and the
    connection reads nothing more until it returns. It must not block, and
    must never wait for another query on the same client or pool: a pool may
    lend that very connection to the query, which then waits forever. The
    ...Async variants run it on another thread."
-  [client sql]
-  #?(:clj  (let [cf (CompletableFuture.)]
-             (submit client (request sql {:fetch-size 0 :sink (Collector. #(.complete cf %) #(.completeExceptionally cf %) (transient []) nil)}))
-             cf)
-     :cljs (js/Promise. (fn [ok fail]
-                          (submit client (request sql {:fetch-size 0 :sink (Collector. ok fail (transient []) nil)}))))))
+  ([client sql] (execute client sql nil))
+  ([client sql {:keys [cancel] :as opts}]
+   #?(:clj  (let [cf (CompletableFuture.)]
+              (query client sql (collector #(.complete cf %) #(.completeExceptionally cf %) cancel) opts)
+              cf)
+      :cljs (js/Promise. (fn [ok fail] (query client sql (collector ok fail cancel) opts))))))
+
+#?(:clj
+   (def ^:private plan-batch-size
+     "Most rows plan's sink hands over at once. Its queue holds two batches,
+      so with the batch being reduced and one waiting to go on the queue, at
+      most 64 rows are read ahead of the reducing function. That keeps a
+      reduce that stops early from asking the server for another fetch-size
+      batch."
+     16))
+
+#?(:clj (def ^:private plan-end (Object.)))
+
+#?(:clj
+   (deftype PlanSink [^ArrayBlockingQueue q done ^:unsynchronized-mutable rows]
+     ;; Each put follows a check of done, and the reduce clears q after
+     ;; setting done, so a put made after the reduce has left finds room.
+     Sink
+     (-row! [this ms row]
+       (set! rows (conj! rows row))
+       (if (< (count rows) plan-batch-size) true (-flush! this ms)))
+     (-flush! [_ _]
+       (cond @done                false
+             (zero? (count rows)) true
+             :else                (let [batch (persistent! rows)]
+                                    (set! rows (transient []))
+                                    (.put q batch)
+                                    (not @done))))
+     (-error! [this ms err]
+       (and (-flush! this ms) (do (.put q [err]) (not @done))))
+     (-end! [this ms]
+       (when (-flush! this ms) (.put q plan-end)))))
 
 #?(:clj
    (defn plan
@@ -532,39 +560,91 @@
      ([client sql {:keys [fetch-size]}]
       (reify clojure.lang.IReduceInit
         (reduce [_ f init]
-          (let [out (async/chan 1 cat)]
-            (submit client (request sql {:fetch-size (or fetch-size default-fetch-size)
-                                         :sink       (chan-sink out)}))
+          (let [q    (ArrayBlockingQueue. 2)
+                done (volatile! false)]
+            (query client sql (PlanSink. q done (transient [])) {:fetch-size (or fetch-size default-fetch-size)})
             (try
               (loop [acc init]
-                (let [row (async/<!! out)]
-                  (cond
-                    (nil? row)   acc
-                    (error? row) (throw row)
-                    :else        (let [acc (f acc row)]
-                                   (if (reduced? acc) @acc (recur acc))))))
+                (let [batch (.take q)]
+                  (if (identical? plan-end batch)
+                    acc
+                    (let [^clojure.lang.IPersistentVector batch batch
+                          acc (loop [i 0
+                                     acc acc]
+                                (if (< i (.count batch))
+                                  (let [row (.nth batch i)]
+                                    (when (error? row) (throw row))
+                                    (let [acc (f acc row)]
+                                      (if (reduced? acc) acc (recur (inc i) acc))))
+                                  acc))]
+                      (if (reduced? acc) @acc (recur acc))))))
               (finally
-                ;; A put already waiting outlives close!, so take until out is
-                ;; empty; the next put is refused and the client stops the server.
-                (async/close! out)
-                (loop [] (when (async/poll! out) (recur)))))))))))
-
-(defmacro <query!
-  "Inside a go block, parks until the query finishes and returns a vector of
-   all its rows (and any error)."
-  [client sql]
-  (if (:ns &env)
-    `(cljs.core.async/<! (cljs.core.async/into [] (query ~client ~sql)))
-    `(clojure.core.async/<! (clojure.core.async/into [] (query ~client ~sql)))))
+                ;; Refuses the rows still to come, and frees the reader if
+                ;; it waits to put more; the connection then stops the server.
+                (vreset! done true)
+                (.clear q)))))))))
 
 ;; ---- LISTEN and NOTIFY
 ;;
 ;; A client's :listeners maps each channel name it listens on to its
-;; listeners, each {:ch ch :buf buf :max-queued n}. The reader puts each
-;; notification on every listener of its channel with offer!, so it never
-;; waits for one. LISTEN and UNLISTEN are queries of their own, sent as the
-;; first listener of a name comes and the last goes, under a lock so they go
-;; out in the order those changes were made.
+;; listeners, each {:key k :listener l}: l is a Listener, and k what unlisten
+;; finds it by. The reader hands each notification to every listener of its
+;; channel, none of which makes it wait. LISTEN and UNLISTEN are queries of
+;; their own, sent as the first listener of a name comes and the last goes,
+;; under a lock so they go out in the order those changes were made.
+
+(defprotocol Listener
+  "Where a channel name's notifications go; see add-listener!. The reader
+   calls these, so they must not wait."
+  (-notify! [l notification]
+    "Takes a notification. Returns true; :full if l has fallen behind,
+     which ends it with an error; or false if its reader has gone, which
+     ends it quietly.")
+  (-stop! [l err] "Ends l, with err unless it's nil. Called once."))
+
+(defn- call-listener [f x]
+  (try (f x)
+       (catch #?(:clj Throwable :cljs :default) e
+         (log/error "Error in a listen callback" e))))
+
+;; listen's listener: f takes each notification after the reader has moved
+;; on, from a thread of its own on the JVM, and from a microtask in JS.
+#?(:clj
+   (deftype QueueListener [^LinkedBlockingQueue q max-queued stopped]
+     Listener
+     (-notify! [_ n]
+       (cond @stopped                 false
+             (<= max-queued (.size q)) :full
+             :else                    (do (.put q n) true)))
+     (-stop! [_ err]
+       (vreset! stopped true)
+       (.put q [::stop err])))
+   :cljs
+   (deftype QueueListener [f pending max-queued stopped]
+     Listener
+     (-notify! [_ n]
+       (cond @stopped                    false
+             (<= max-queued @pending)     :full
+             :else                       (do (vswap! pending inc)
+                                             (js/queueMicrotask (fn [] (vswap! pending dec) (call-listener f n)))
+                                             true)))
+     (-stop! [_ err]
+       (vreset! stopped true)
+       (js/queueMicrotask #(call-listener f err)))))
+
+(defn- queue-listener [f max-queued]
+  #?(:clj  (let [q (LinkedBlockingQueue.)]
+             (doto (Thread. ^Runnable (fn []
+                                        (loop []
+                                          (let [x (.take q)]
+                                            (if (and (vector? x) (= ::stop (first x)))
+                                              (call-listener f (second x))
+                                              (do (call-listener f x) (recur))))))
+                            "clunk-listener")
+               (.setDaemon true)
+               (.start))
+             (QueueListener. q max-queued (volatile! false)))
+     :cljs (QueueListener. f (volatile! 0) max-queued (volatile! false))))
 
 (defn- quote-ident
   "name as a quoted SQL identifier, so any name is taken as it is."
@@ -575,15 +655,8 @@
   "Runs sql on client for its effect, calling on-error with the error if it fails."
   ([client sql] (run-sql! client sql nil))
   ([client sql on-error]
-  (submit client (request sql {:fetch-size 0
-                               :sink (Collector. (fn [_]) (or on-error (fn [_])) (transient []) nil)}))))
-
-(defn- end-listener!
-  "Closes l's channel, after err if there is one. The extra slot in its
-   buffer always has room for err."
-  [l err]
-  (when err (async/offer! (:ch l) err))
-  (async/close! (:ch l)))
+   (submit client (request sql {:fetch-size 0
+                                :sink       (collector (fn [_]) (or on-error (fn [_])))}))))
 
 (defn- remove-listeners!
   "Removes the listeners of channel-name that keep? doesn't keep and ends
@@ -596,88 +669,91 @@
                                   (fn [m]
                                     (let [kept (filterv keep? (get m channel-name))]
                                       (if (seq kept) (assoc m channel-name kept) (dissoc m channel-name)))))]
-        (run! #(end-listener! % err) (remove keep? (get old channel-name)))
+        (run! #(-stop! (:listener %) err) (remove keep? (get old channel-name)))
         (when (and (contains? old channel-name) (not (contains? new channel-name)))
           (run client (str "UNLISTEN " (quote-ident channel-name))))))))
 
 (defn- on-notification
-  "Puts a notification on each listener of its channel. A listener that has
-   max-queued notifications waiting gets an error instead and is closed, and
-   one whose channel was closed is dropped, so neither holds up the reader."
+  "Hands a notification to each listener of its channel. One that has
+   fallen behind is ended with an error, and one whose reader has gone is
+   dropped, so neither holds up the reader."
   [{:keys [listeners] :as client} {:keys [channel payload pid]}]
   (let [n (array-map :channel channel :payload payload :pid pid)]
-    (doseq [{:keys [ch buf max-queued] :as l} (get @listeners channel)]
-      (cond
-        (async-impl/closed? ch)
-        (remove-listeners! client channel #(not= l %) nil run-sql!)
-
-        (<= max-queued (count buf))
-        (remove-listeners! client channel #(not= l %)
-                           (error "Listener fell behind" {:channel channel :max-queued max-queued})
-                           run-sql!)
-
-        :else
-        (async/offer! ch n)))))
+    (doseq [{l :listener :as e} (get @listeners channel)]
+      (case (-notify! l n)
+        true  nil
+        :full (remove-listeners! client channel #(not= e %)
+                                 (error "Listener fell behind" {:channel channel})
+                                 run-sql!)
+        (remove-listeners! client channel #(not= e %) nil run-sql!)))))
 
 (defn- close-listeners!
-  "The connection is gone: every listener closes, after err if there is one."
+  "The connection is gone: every listener ends, with err if there is one."
   [{:keys [listeners]} err]
   (let [[old] (swap-vals! listeners empty)]
-    (doseq [l (apply concat (vals old))]
-      (end-listener! l err))))
+    (doseq [e (apply concat (vals old))]
+      (-stop! (:listener e) err))))
+
+(defn add-listener!
+  "Hands channel-name's notifications to l, a Listener, from the time LISTEN
+   has run, and returns k, which unlisten takes to remove it. listen,
+   clunk.async/listen and clunk.node/listen are built on it. Ends l with an
+   error at once if the client can't listen."
+  [client channel-name k l]
+  (let [c (listener client)
+        e {:key k :listener l}]
+    (if (error? c)
+      (-stop! l c)
+      (with-lock (:listeners c)
+        (fn []
+          (let [[old] (swap-vals! (:listeners c) update channel-name (fnil conj []) e)]
+            (when-not (contains? old channel-name)
+              (submit c (request (str "LISTEN " (quote-ident channel-name))
+                                 {:fetch-size 0
+                                  :sink       (collector
+                                               ;; A closed client ends a query with no error.
+                                               (fn [_]
+                                                 (when (#{:failed :closed} (:phase @(:state c)))
+                                                   (close-listeners! c nil)))
+                                               (fn [err]
+                                                 (remove-listeners! c channel-name (constantly false) err run-sql!)))})))))))
+    k))
 
 (defn listen
-  "Listens for notifications on channel-name, a LISTEN channel, and returns a
-   core.async channel of them, each {:channel name :payload text :pid
-   notifying-backend-pid}, from the time LISTEN has run.
+  "Listens for notifications on channel-name, a LISTEN channel, from the time
+   LISTEN has run, and calls f with each, a map of :channel, :payload and the
+   notifying backend's :pid. When the listener ends, f is called once more:
+   with an error value if it ended with one, else with nil. Returns a handle
+   for unlisten.
 
    On a pool, every listener shares one connection of its own, which the pool
    never lends to queries and which doesn't count toward :max-size.
 
-   The connection never waits for a listener: one with :max-queued (default
-   1000) notifications not yet taken gets an error value instead and closes.
-   If LISTEN fails, or the connection drops, the channel gets an error value
-   and closes. A clunk/close closes it with no error. To stop, call unlisten;
-   closing the channel yourself stops it too, as the next notification on
-   channel-name arrives. UNLISTEN goes once no listener is left on the name."
-  ([client channel-name] (listen client channel-name nil))
-  ([client channel-name {:keys [max-queued] :or {max-queued 1000}}]
-   (let [c   (listener client)
-         buf (async/buffer (inc max-queued)) ;; the last slot is for an error
-         ch  (async/chan buf)
-         l   {:ch ch :buf buf :max-queued max-queued}]
-     (if (error? c)
-       (end-listener! l c)
-       (with-lock (:listeners c)
-         (fn []
-           (let [[old] (swap-vals! (:listeners c) update channel-name (fnil conj []) l)]
-             (when-not (contains? old channel-name)
-               (submit c (request (str "LISTEN " (quote-ident channel-name))
-                                  {:fetch-size 0
-                                   :sink       (Collector.
-                                                ;; A closed client ends a query with no error.
-                                                (fn [_]
-                                                  (when (#{:failed :closed} (:phase @(:state c)))
-                                                    (close-listeners! c nil)))
-                                                (fn [err]
-                                                  (remove-listeners! c channel-name (constantly false) err run-sql!))
-                                                (transient [])
-                                                nil)})))))))
-     ch)))
+   f never runs on the connection's reader: on the JVM each listener calls
+   it from a thread of its own, and in JS from a microtask, one call at a
+   time. So a slow f doesn't hold up queries; instead, a listener with
+   :max-queued (default 1000) notifications waiting for f ends with an
+   error. If LISTEN fails, or the connection drops, it ends with an error;
+   clunk/close and unlisten end it with nil. UNLISTEN goes once no listener
+   is left on the name."
+  ([client channel-name f] (listen client channel-name f nil))
+  ([client channel-name f {:keys [max-queued] :or {max-queued 1000}}]
+   (let [l (queue-listener f max-queued)]
+     (add-listener! client channel-name l l))))
 
 (defn unlisten
-  "Stops listening: x is a channel listen returned, which closes, or a
-   channel name, whose listeners all close. Sends UNLISTEN once no listener
-   is left on the name. Returns a CompletableFuture or js/Promise that
-   settles once the server has stopped sending them, or nil if there was
-   nothing to stop."
+  "Stops listening: x is what listen returned (or clunk.async/listen's
+   channel), which ends, or a channel name, whose listeners all end. Sends
+   UNLISTEN once no listener is left on the name. Returns a
+   CompletableFuture or js/Promise that settles once the server has stopped
+   sending them, or nil if there was nothing to stop."
   [client x]
   (let [c (listener client)]
     (when-not (error? c)
       (if (string? x)
         (remove-listeners! c x (constantly false) nil execute)
-        (when-let [[channel-name] (first (filter (fn [[_ ls]] (some #(= x (:ch %)) ls)) @(:listeners c)))]
-          (remove-listeners! c channel-name #(not= x (:ch %)) nil execute))))))
+        (when-let [[channel-name] (first (filter (fn [[_ ls]] (some #(= x (:key %)) ls)) @(:listeners c)))]
+          (remove-listeners! c channel-name #(not= x (:key %)) nil execute))))))
 
 (defn notify
   "Sends payload, a string, to the listeners of channel-name with

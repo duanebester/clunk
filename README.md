@@ -13,22 +13,23 @@ Talking to Postgres via sockets. At this point in time, I'm just experimenting w
 
 ### Example
 
+clunk needs nothing but Clojure (or, on Node, nothing but Node). Its [core.async API](#coreasync) is optional.
+
 ```clj
 (ns scratch.client
-  (:require
-   [clojure.core.async :as async]
-   [clunk.core :as clunk]))
+  (:require [clunk.core :as clunk]))
 
 (def client (clunk/client {:username "jimmy"
                            :password "banana"
                            :database "world"}))
 
-;; Authenticates (MD5 or SCRAM-SHA-256). The channel yields the server's
-;; ReadyForQuery message, or an error. Queries made before then wait their turn.
-(async/<!! (clunk/connect client))
+;; Authenticates (MD5 or SCRAM-SHA-256). connect returns a CompletableFuture
+;; (a js Promise in ClojureScript) of the server's ReadyForQuery message, which
+;; fails if connecting or authenticating does. Queries made before then wait their turn.
+@(clunk/connect client)
 ```
 
-For TLS, as hosted Postgres (RDS, Supabase, Neon, Cloud SQL) needs, set `:ssl` to a mode named as libpq's `sslmode` is. `:verify-full` (or `true`) checks that the server's certificate is signed by a trusted CA and names the host; `:verify-ca` checks only the CA; `:require` encrypts without checking; `:prefer` encrypts if the server offers TLS and otherwise doesn't; `:disable`, the default, never asks. Without `:ssl-root-cert`, the CAs trusted are the JVM's, or on Node, Node's bundled ones; providers whose CA isn't among them, such as RDS and Supabase, publish one to download. A failed handshake, or a server that won't talk TLS when the mode needs it, fails the connection with the reason: `client` throws on the JVM, and `connect` yields the error on Node.
+For TLS, as hosted Postgres (RDS, Supabase, Neon, Cloud SQL) needs, set `:ssl` to a mode named as libpq's `sslmode` is. `:verify-full` (or `true`) checks that the server's certificate is signed by a trusted CA and names the host; `:verify-ca` checks only the CA; `:require` encrypts without checking; `:prefer` encrypts if the server offers TLS and otherwise doesn't; `:disable`, the default, never asks. Without `:ssl-root-cert`, the CAs trusted are the JVM's, or on Node, Node's bundled ones; providers whose CA isn't among them, such as RDS and Supabase, publish one to download. A failed handshake, or a server that won't talk TLS when the mode needs it, fails the connection with the reason: `client` throws on the JVM, and `connect`'s promise rejects on Node.
 
 ```clj
 (clunk/client {:hostname "db.example.com" :username "jimmy" :password "banana" :database "world"
@@ -71,9 +72,25 @@ To handle rows as they arrive, without holding them all in memory, reduce `plan`
 (into [] (map :name) (clunk/plan client ["SELECT name FROM city WHERE countrycode = $1" "NLD"] {:fetch-size 100}))
 ```
 
+#### Cancelling
+
+To stop a query early from elsewhere, as when the HTTP client it serves has gone, pass a cancel token as `:cancel` to `execute` and fire it with `cancel!`. A query still waiting for a pool's connection then never runs. A running one stops reading rows, and since a query with `:cancel` has the server send its rows in batches of `:fetch-size` (1000 by default), the server stops after the current batch. Either way `execute` fails with an error whose `ex-data` has `:cancelled true`. As with `plan`, such a query is a single statement.
+
+```clj
+(let [token  (clunk/cancel-token)
+      result (clunk/execute client "SELECT * FROM city" {:cancel token :fetch-size 100})]
+  (clunk/cancel! token)
+  (try @result
+       (catch java.util.concurrent.ExecutionException e
+         (ex-data (ex-cause e)))))
+;; {:cancelled true}
+```
+
+`execute` and `plan` are built on `query`, which hands each row to a `clunk/Sink` as it arrives, and takes `:cancel` and `:fetch-size` too. It's there to adapt clunk to other ways of handling a stream of rows; `clunk.async` and the Node API use it.
+
 #### A pool
 
-A server handling requests at once needs a pool: a client runs one query at a time, so three one-second queries on a shared client take three seconds, and on a pool one. `execute`, `plan`, `query`, and `<query!` take a pool wherever they take a client:
+A server handling requests at once needs a pool: a client runs one query at a time, so three one-second queries on a shared client take three seconds, and on a pool one. Everything that takes a client takes a pool too:
 
 ```clj
 (require '[clunk.pool :as pool])
@@ -84,7 +101,7 @@ A server handling requests at once needs a pool: a client runs one query at a ti
 ;; [{:name "Afghanistan"}]
 ```
 
-A pool takes the same config as a client, plus `:max-size` (10 by default). It connects only when a query needs a connection and none is idle, so making one doesn't touch the server and there's no `connect` to call. Each query borrows a connection until its last row is read, or until it is cancelled: a `plan` reduce holds one until it returns, and a `query` channel until it closes. Queries beyond `:max-size` wait for a free connection, and a `:cancel` that fires while a query waits means it never runs. A connection the server dropped, whether idle or during a query, is replaced by a new one for the next query. A failed connect fails just the query that needed it.
+A pool takes the same config as a client, plus `:max-size` (10 by default). It connects only when a query needs a connection and none is idle, so making one doesn't touch the server and there's no `connect` to call. Each query borrows a connection until its last row is read, or until it is cancelled: a `plan` reduce holds one until it returns, and a `clunk.async` channel until it closes. Queries beyond `:max-size` wait for a free connection, and a `:cancel` that fires while a query waits means it never runs. A connection the server dropped, whether idle or during a query, is replaced by a new one for the next query. A failed connect fails just the query that needed it.
 
 `clunk/close` closes the idle connections at once and the busy ones as their queries finish. Queries after that fail with "Pool is closed".
 
@@ -132,12 +149,43 @@ The future completes on the thread that reads the connection, so a function give
                           (respond {:status 200 :body (json/write-str rows)})))))
 ```
 
-#### core.async
+#### LISTEN and NOTIFY
 
-`clunk/query` returns a channel of row maps that closes after the last row. It takes a string or a vector with parameters, as `execute` does. A failed query puts an `ex-info` on the channel (check with `clunk/error?`) instead of throwing.
+`listen` sends `LISTEN` and calls a function with each notification sent on that channel name, from any connection, as a map of `:channel`, `:payload`, and the notifying backend's `:pid`. They arrive whenever the server sends them, while the connection is idle or between a query's results. When the listener ends, the function is called once more, with an error value if it ended with one (check with `clunk/error?`), and otherwise with `nil`. `listen` returns a handle for `unlisten`. `notify` sends a notification with `pg_notify` and returns a future, or a js Promise, of `nil`:
 
 ```clj
-(async/go-loop [ch (clunk/query client "SELECT name FROM country ORDER BY name LIMIT 3;")]
+(def events (clunk/listen client "events" (fn [n] (when n (println n)))))
+
+@(clunk/notify db "events" "naïve café 🐘")
+;; prints {:channel "events", :payload "naïve café 🐘", :pid 4242}
+
+(clunk/unlisten client events) ;; or a channel name, to end all its listeners
+```
+
+The function never runs on the thread that reads the connection: each listener calls it from a thread of its own on the JVM, and from a microtask in JS, one notification at a time. So a slow function doesn't hold up queries; instead, a listener with `:max-queued` notifications waiting for it (`(clunk/listen client "events" f {:max-queued 1000})` is the default) ends with an error. If `LISTEN` fails, or the connection drops, every listener ends with an error; `clunk/close` and `unlisten` end them with `nil`. `unlisten` sends `UNLISTEN` once no listener is left on the name. On a pool, listeners share one connection of their own, which the pool never lends to queries and doesn't count toward `:max-size`.
+
+```clj
+(clunk/close client)
+```
+
+#### core.async
+
+`clunk.async` has the core.async API: rows and notifications on channels. clunk doesn't depend on core.async, so add it to your own dependencies to use it:
+
+```clj
+;; deps.edn
+org.clojure/core.async {:mvn/version "1.9.865"}
+```
+
+```clj
+(require '[clojure.core.async :as async]
+         '[clunk.async :as ca])
+```
+
+`ca/query` returns a channel of row maps that closes after the last row. It takes a string or a vector with parameters, as `execute` does. A failed query puts an `ex-info` on the channel (check with `clunk/error?`) instead of throwing. `ca/connect` returns a channel that yields the server's ReadyForQuery message or an error.
+
+```clj
+(async/go-loop [ch (ca/query client "SELECT name FROM country ORDER BY name LIMIT 3;")]
   (when-let [row (async/<! ch)]
     (println row)
     (recur ch)))
@@ -147,13 +195,13 @@ To stop early, pass a `:cancel` channel and close it. The row channel closes bef
 
 ```clj
 (let [cancel (async/promise-chan)
-      rows   (clunk/query client "SELECT * FROM city" {:cancel cancel})]
+      rows   (ca/query client "SELECT * FROM city" {:cancel cancel})]
   (println (async/<!! rows))
   (async/close! cancel))
 
-(clunk/query client "SELECT * FROM city" {:cancel (async/timeout 1000)})
+(ca/query client "SELECT * FROM city" {:cancel (async/timeout 1000)})
 
-(clunk/query client ["SELECT * FROM city WHERE population > $1" 1000000] {:cancel cancel :fetch-size 100})
+(ca/query client ["SELECT * FROM city WHERE population > $1" 1000000] {:cancel cancel :fetch-size 100})
 ```
 
 A `promise-chan` or a `timeout` is the reliable kind of `:cancel` channel, because every check sees it once it fires. A value put on a plain channel is seen only once, so a pooled query that gets its connection just as the value arrives can still run, with its rows discarded.
@@ -162,33 +210,26 @@ Inside a go block, `<query!` parks until the query finishes and returns all its 
 
 ```clj
 (async/go
-  (println (clunk/<query! client "SELECT 1::int4 AS one;")))
+  (println (ca/<query! client "SELECT 1::int4 AS one;")))
 ;; [{:one 1}]
 ```
 
-#### LISTEN and NOTIFY
-
-`listen` sends `LISTEN` and returns a channel of the notifications sent on that channel name, from any connection, as maps of `:channel`, `:payload`, and the notifying backend's `:pid`. They arrive whenever the server sends them, while the connection is idle or between a query's results. `notify` sends one with `pg_notify` and returns a future, or a js Promise, of `nil`:
+`ca/listen` returns a channel of a channel name's notifications. The connection never waits for it: a channel that leaves `:max-queued` notifications untaken (1000 by default) gets an error value and closes. If `LISTEN` fails or the connection drops, it gets an error value and closes, and `clunk/close` closes it. Pass the channel to `clunk/unlisten` to stop; closing it yourself does the same when its next notification arrives.
 
 ```clj
-(def events (clunk/listen client "events"))
-
-@(clunk/notify db "events" "naïve café 🐘")
+(def events (ca/listen client "events"))
 (async/<!! events)
 ;; {:channel "events", :payload "naïve café 🐘", :pid 4242}
-
-(clunk/unlisten client events) ;; or a channel name, to end all its listeners
+(clunk/unlisten client events)
 ```
 
-The connection never waits for a listener: one that leaves `:max-queued` notifications untaken (`(clunk/listen client "events" {:max-queued 1000})` is the default) gets an error value and closes instead. If the connection drops, every listener gets an error value and closes. `unlisten` closes the channel and sends `UNLISTEN` once no listener is left on the name; closing the channel yourself does the same when its next notification arrives. On a pool, listeners share one connection of their own, which the pool never lends to queries and doesn't count toward `:max-size`.
+#### Logging
 
-```clj
-(clunk/close client)
-```
+clunk logs through `System.Logger`, under the name `clunk`, on the JVM, so it goes wherever your JDK logging goes: to `java.util.logging` unless a bridge such as `slf4j-jdk-platform-logging` sends it elsewhere. It logs an error when it closes a connection after failing to read it, and when a `listen` function throws, and at debug level each message the server sends while the connection starts. On Node, errors go to `console.error`, and debug messages to `util.debuglog`, so `NODE_DEBUG=clunk` shows them.
 
 ### Node
 
-The same code compiles to a CommonJS module with a Promise API:
+The same code compiles to a CommonJS module with a Promise API, with nothing to install:
 
 ```bash
 clojure -M:cljs release node   # writes target/node/clunk.js
@@ -322,7 +363,7 @@ clojure -T:build install   # into ~/.m2
 CLOJARS_USERNAME=... CLOJARS_PASSWORD=... clojure -T:build deploy
 ```
 
-clunk has no third-party runtime dependencies: the binary codec, [BinF](https://github.com/helins/binf.cljc), is vendored under [`src/clunk/vendor`](src/clunk/vendor/binf/README.md).
+clunk has no runtime dependencies beyond Clojure: the binary codec, [BinF](https://github.com/helins/binf.cljc), is vendored under [`src/clunk/vendor`](src/clunk/vendor/binf/README.md). The pom lists core.async as optional, for `clunk.async`, so Maven and tools.deps leave it out unless you add it.
 
 Rough Todo / Help needed
 

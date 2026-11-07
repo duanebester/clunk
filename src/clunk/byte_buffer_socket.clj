@@ -1,5 +1,5 @@
 (ns clunk.byte-buffer-socket
-  (:require [clojure.tools.logging :as log]
+  (:require [clunk.log :as log]
             [clunk.tls :as tls])
   (:import
    (java.nio ByteBuffer)
@@ -47,13 +47,13 @@
                       (on-chunk chunk)
                       (recur)))))
               (catch Throwable t
-                (log/error t "Closing the connection after an error reading it"))
+                (log/error "Closing the connection after an error reading it" t))
               (finally
                 ;; Closed first, so connected? is false by the time on-close runs.
                 (try (.close client) (catch java.io.IOException _))
                 (try (on-close)
                      (catch Throwable t
-                       (log/error t "Error ending the connection's queries")))))))]
+                       (log/error "Error ending the connection's queries" t)))))))]
     (doto (Thread. read-loop reader-name)
       (.setDaemon true)
       (.start)))
@@ -71,7 +71,7 @@
          (.write client bs))
        ;; A connection the server closed fails its write; the read loop
        ;; already reports that to the query, so it's only debug.
-       (catch java.io.IOException e (log/debug e "Write to a closed connection"))))
+       (catch java.io.IOException e (log/debug "Write to a closed connection" e))))
 
 ;; The reader thread blocks to push back, so there's nothing to pause.
 (defn pause [_])

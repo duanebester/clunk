@@ -1,5 +1,6 @@
 (ns clunk.byte-buffer-socket
-  (:require [clunk.tls :as tls]))
+  (:require [clunk.log :as log]
+            [clunk.tls :as tls]))
 
 (defn connected?
   "True until the socket is destroyed, as it is once the server hangs up.
@@ -33,7 +34,7 @@
   (.on client "data" (fn [d]
                        (try (on-chunk (chunk->buffer d))
                             (catch :default e
-                              (js/console.error "clunk: closing the connection" e)
+                              (log/error "Closing the connection after an error reading it" e)
                               (.destroy client)))))
   (.on client "close" (fn [_] (on-close))))
 

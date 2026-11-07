@@ -2,9 +2,10 @@
   "A pool of clients, so queries run in parallel on up to :max-size
    connections. query, execute and plan take a pool wherever they take a
    client."
-  (:require [clojure.core.async :as async]
-            [clunk.core :as clunk]
-            [clunk.message-socket :as ms]))
+  (:require [clunk.core :as clunk]
+            [clunk.message-socket :as ms])
+  #?(:clj (:import (java.util.concurrent CompletableFuture)
+                   (java.util.function BiConsumer))))
 
 ;; The pool's state lives in one atom, and every change to it is a swap that
 ;; decides what to do from the state it replaced, so it's safe across JVM
@@ -21,14 +22,23 @@
   (ms/connected? (:message-socket client)))
 
 (defn- new-client
-  "A channel that yields a client, or an error. The JVM's client connects its
-   socket as it's made, which blocks, so that happens on its own thread."
-  [config]
-  #?(:clj  (async/thread
-             (try (clunk/client config)
-                  (catch Exception e
-                    (ex-info (str "Could not connect: " (ex-message e)) {} e))))
-     :cljs (async/to-chan! [(clunk/client config)])))
+  "Makes a client and calls f with it, or with an error, later rather than
+   inside the caller. The JVM's client connects its socket as it's made,
+   which blocks, so that happens on a thread of its own."
+  [config f]
+  (let [make #(f (try (clunk/client config)
+                      (catch #?(:clj Exception :cljs :default) e
+                        (ex-info (str "Could not connect: " (ex-message e)) {} e))))]
+    #?(:clj  (doto (Thread. ^Runnable make "clunk-connect")
+               (.setDaemon true)
+               (.start))
+       :cljs (js/queueMicrotask make))))
+
+(defn- when-settled
+  "Calls f with what connect's future or promise yields, or its error."
+  [p f]
+  #?(:clj  (.whenComplete ^CompletableFuture p (reify BiConsumer (accept [_ v e] (f (or e v)))))
+     :cljs (.then p f f)))
 
 (declare free-slot! checkin!)
 
@@ -36,16 +46,19 @@
   "Opens a client in a slot already counted in :size and calls lend with it,
    or with an error after giving the slot up."
   [{:keys [config state] :as pool} lend]
-  (async/go
-    (let [c     (async/<! (new-client config))
-          ready (if (clunk/error? c) c (async/<! (clunk/connect c)))
-          err   (cond (clunk/error? ready) ready
-                      (:closed? @state)    (closed-error))]
-      (if err
-        (do (when-not (clunk/error? c) (clunk/close c))
-            (free-slot! pool)
-            (lend err))
-        (when-not (lend c) (checkin! pool c))))))
+  (new-client config
+              (fn [c]
+                (let [give-up! (fn [err]
+                                 (when-not (clunk/error? c) (clunk/close c))
+                                 (free-slot! pool)
+                                 (lend err))]
+                  (if (clunk/error? c)
+                    (give-up! c)
+                    (when-settled (clunk/connect c)
+                      (fn [ready]
+                        (cond (clunk/error? ready) (give-up! ready)
+                              (:closed? @state)    (give-up! (closed-error))
+                              :else                (when-not (lend c) (checkin! pool c))))))))))
 
 (defn- free-slot!
   "Gives up a slot whose client is gone: the next waiter gets a new client in
@@ -108,7 +121,7 @@
                       (cond
                         (clunk/error? c)          (do (clunk/fail! request c) true)
                         ;; A query cancelled while it waited must not run.
-                        (clunk/cancelled? request) (do (clunk/fail! request nil) false)
+                        (clunk/cancelled? (:cancel request)) (do (clunk/fail! request nil) false)
                         :else                     (do (clunk/submit c (assoc request :done #(checkin! this c)))
                                                       true)))))
   (listener [_]

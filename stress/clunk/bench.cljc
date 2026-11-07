@@ -12,6 +12,7 @@
    query one after another, for a warmup and then `seconds` of counting, and
    reports queries and rows per second."
   (:require #?(:clj [clojure.core.async :as async] :cljs [cljs.core.async :as async])
+            [clunk.async :as ca]
             [clunk.core :as clunk]))
 
 (def config {:username "jimmy" :password "banana" :database "world"})
@@ -41,7 +42,7 @@
                         (let [got (async/<! (async/reduce (fn [c row]
                                                             (when (clunk/error? row) (throw row))
                                                             (inc c))
-                                                          0 (clunk/query client sql)))]
+                                                          0 (ca/query client sql)))]
                           (when (not= rows got)
                             (throw (ex-info "Wrong row count" {:got got :want rows})))
                           (recur (inc n)))
@@ -56,7 +57,7 @@
     (let [client (clunk/client (cond-> config
                                  ssl         (assoc :ssl (keyword ssl) :ssl-root-cert "test/tls/certs/ca.crt")
                                  negotiation (assoc :ssl-negotiation (keyword negotiation))))]
-      (async/<! (clunk/connect client))
+      (async/<! (ca/connect client))
       (println (str "platform " #?(:clj "jvm" :cljs "node") ", " seconds " s per case, ssl " (or ssl "disable")
                     (when negotiation (str " " negotiation))))
       (doseq [{:keys [name rows callers] :as c} cases]
